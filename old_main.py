@@ -67,51 +67,6 @@ def md5_file(path):
 
 
 ###############################################################################
-# Dataset utils.
-###############################################################################
-def maybe_download(path, url, md5_):
-    """ Download a file if it's not locally present, raise if the md5 doesn't match.
-    """
-    if Path(path).exists():
-        computed_md5 = md5_file(path)
-        if not computed_md5 == md5_:
-            print(
-                f"Expected: '{md5_}', {len(md5_)}\n"
-                f"Got:      '{computed_md5}', {len(md5_)}"
-            )
-            raise ValueError(
-                f"md5 mismatch for {path}\n."
-            )
-
-    if not Path(path).exists():
-        wget.download(url, path)
-
-
-def load_dataset(path):
-    all_lines = Path(path).read_text().strip().split("\n")
-    inputs = []
-    labels = []
-    for input_val, labels_val, _ in [x.split("\t") for x in all_lines]:
-        inputs.append(input_val)
-        labels.append(labels_val)
-
-    return inputs, labels
-
-
-def prepare_ds(tokenizer, x, y):
-    ds = datasets.Dataset.from_dict(dict(x=x, y=y))
-    ds = ds.map(
-        lambda example: tokenizer(example["x"], truncation=True), 
-        remove_columns=["x"],
-    )
-    ds = ds.map(
-        lambda example: dict(labels=tokenizer(example["y"], truncation=True)["input_ids"]), 
-        remove_columns=["y"],
-    )
-    return ds
-
-
-###############################################################################
 # Metrics.
 ###############################################################################
 class OurMetric(abc.ABC):
@@ -592,20 +547,6 @@ GENERATION_KWARGS = dict(
 )
 
 
-######
-## Dataset information
-######
-TRAIN_PATH = "./train.tsv"
-TRAIN_URL = "https://github.com/najoungkim/COGS/blob/main/data/train.tsv?raw=true"
-TRAIN_MD5 = "063d79fdfcacf8b04c64d430f7da6717"
-
-EVAL_PATH = "./dev.tsv"
-EVAL_URL = "https://raw.githubusercontent.com/najoungkim/COGS/main/data/dev.tsv"
-EVAL_MD5 = "69ab5bf9425339f24a732785a0982744"
-
-GEN_PATH = "./gen.tsv"
-GEN_URL = "https://github.com/najoungkim/COGS/blob/main/data/gen.tsv?raw=true"
-GEN_MD5 = "e6d4a859a25af9ba3319b2a27815a181"
 
 
 #####

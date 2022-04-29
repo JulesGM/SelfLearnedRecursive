@@ -1,20 +1,21 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-print("loading modules")
 import dataclasses
+import logging
 import math
 from pathlib import Path
+import pickle
+import time
 
-
-import json
 import numpy as np
 import random
 import rich
 import tqdm
 from typing import *
-print("Done loading modules")
+import ujson as json
 
+LOGGER = logging.getLogger(__name__)
 
 SCRIPT_DIR = Path(__file__).absolute().parent
 
@@ -103,14 +104,22 @@ class Node:
             
         return self._oracle_str
 
-    def get_pseudo(self, prediction_function):
+    def get_pseudo(self, prediction_function, is_root):
+        """ 
+        is_root: whether this node is the root of the tree. 
+            Necessary because we need to either put the oracle 
+            answer in the string if it is the root, or nothing at all.
+        """
         # Multiple calls will have DIFFERENT RESULTS
 
         if self.children is not None:
-            a_str, a_pred = self.children[0].get_pseudo(prediction_function)
-            b_str, b_pred = self.children[1].get_pseudo(prediction_function)
-            prediction = prediction_function(a_pred, b_pred)
-            self._pseudo_str = f"({a_str} {self.get_op()} {b_str} = {prediction})"
+            a_str, a_pred = self.children[0].get_pseudo(prediction_function, False)
+            b_str, b_pred = self.children[1].get_pseudo(prediction_function, False)
+            if is_root:
+                answer = self.get_value()
+            else:
+                answer = prediction_function(a_pred, b_pred)
+            self._pseudo_str = f"({a_str} {self.get_op()} {b_str} = {answer})"
         else:
             self._pseudo_str = f"{self.get_value()}"
             prediction = self.get_value()
@@ -119,34 +128,71 @@ class Node:
     def __repr__(self):
         return f"Node({self.get_oracle_str()})"
 
-def generate(config, previous, all_previous, qty_each_op, name=""):
-    for op in config.operators:
-        if qty_each_op == "all" or qty_each_op == len(previous) * len(all_previous):
-            rich.print(f"[red]({name}): Doing all {len(previous) * len(all_previous)}")
+def generate(config, previous, all_previous, qty_required, name=""):
+    """
+    qty_each_op is per direction
+    """
+
+    if qty_required != "all":
+        assert isinstance(qty_required, int) 
+        qty_each_op = math.ceil(qty_required / (len(config.operators)))
+        qty_per_side = math.ceil(qty_each_op / 2)
+
+
+    if qty_required == "all":
+        for op in config.operators:
+            LOGGER.debug(f"({name}): Doing all {len(previous) * len(all_previous)}")
             uniques = set()
+
             for a in previous:
                 for b in all_previous:
                     uniques.add((a, b))
-
-        else:
-            upper_bound = len(previous) * len(all_previous)
-            assert qty_each_op <= upper_bound, f"{qty_each_op = } > {upper_bound = }"
-            a_s = np.random.choice(previous, qty_each_op, replace=True)
-            b_s = np.random.choice(all_previous, qty_each_op, replace=True)
+                    uniques.add((b, a))  
             
-            pre_unique = qty_each_op
-            uniques = set(zip(a_s, b_s))
-            rich.print(f"[red]({name}): {pre_unique = }, {len(uniques) = }, {len(uniques) / pre_unique = :0.1%}")
+            for a, b in uniques:
+                yield Node(op=op, children=[a, b], value=opmap[op](a.get_value(), b.get_value()))
+        return
 
-            while len(uniques) != qty_each_op:
-                a_s = np.random.choice(previous, qty_each_op, replace=True)
-                b_s = np.random.choice(all_previous, qty_each_op, replace=True)
-                good_ones = [x for x in zip(a_s, b_s) if x not in uniques]
-                uniques.update(good_ones[:qty_each_op - len(uniques)])
-                print("[attempt]")
+    else: 
+        for op in config.operators:
+            uniques = set()
 
-        for a, b in uniques:
-            yield Node(op=op, children=[a, b], value=opmap[op](a.get_value(), b.get_value()))
+            for side in ["right", "left"]:
+                if side == "right":
+                    a_s = np.random.choice(previous, qty_per_side, replace=True)
+                    b_s = np.random.choice(all_previous, qty_per_side, replace=True)
+                elif side == "left":
+                    a_s = np.random.choice(all_previous, qty_per_side, replace=True)
+                    b_s = np.random.choice(previous, qty_per_side, replace=True)
+                else:
+                    raise ValueError(side)
+                
+                uniques.update(zip(a_s, b_s))
+                rich.print(
+                    f"[red]({name}): {side = } {qty_per_side = }, "
+                    f"{len(uniques) = }, {len(uniques) / qty_each_op = :0.1%}"
+                )
+
+            while len(uniques) < qty_each_op:
+                for side in ["right", "left"]:
+                    if side == "right":
+                        a_s = np.random.choice(previous, qty_per_side, replace=True)
+                        b_s = np.random.choice(all_previous, qty_per_side, replace=True)
+                    elif side == "left":
+                        a_s = np.random.choice(all_previous, qty_per_side, replace=True)
+                        b_s = np.random.choice(previous, qty_per_side, replace=True)
+                    else:
+                        raise ValueError(side)
+
+                    # We want to add just the right quantity of values. Computing the 
+                    # contains operator twice is a bit awkward, but it's not a big deal 
+                    # (the whole datagen takes under 15 seconds)
+                    good_ones = [x for x in zip(a_s, b_s) if x not in uniques]
+                    uniques.update(good_ones[:qty_each_op - len(uniques)])
+                    LOGGER.debug(f"[attempt] {qty_each_op} {len(uniques)}")
+
+            for a, b in uniques:
+                yield Node(op=op, children=[a, b], value=opmap[op](a.get_value(), b.get_value()))
 
 
 def generate_data(config: "NestedClacConfig") -> Tuple[List[Node], List[Node], List[Node]]:
@@ -165,14 +211,18 @@ def generate_data(config: "NestedClacConfig") -> Tuple[List[Node], List[Node], L
     all_second_l: List[Node] = list(generate(config, first_l, first_l + zeroth_l, "all", "ALL SECONDS"))
     seconds_for_third_l = all_second_l
     
-    qty_each_op = math.ceil(config.qty_third_layer / len(config.operators))
-    third_l = list(generate(config, seconds_for_third_l, seconds_for_third_l + first_l + zeroth_l, qty_each_op, "THIRD"))
+    third_l = list(generate(config, seconds_for_third_l, seconds_for_third_l + first_l + zeroth_l, config.qty_third_layer, "THIRD"))
     
     second_l = list(all_second_l)
     random.shuffle(second_l)
     second_l = second_l[:config.qty_second_layer]
     random.shuffle(third_l)
     third_l = third_l[:config.qty_third_layer]
+
+    print("Final lengths:")
+    print(f"\tfirst_l: {len(first_l)}")
+    print(f"\tsecond_l: {len(second_l)}")
+    print(f"\tthird_l: {len(third_l)}")
 
     return first_l, second_l, third_l
     
@@ -185,18 +235,35 @@ class NestedClacConfig:
 
     # dataset
     operators: Set[str] = dataclasses.field(default_factory=lambda: {"+", "*", "-"})
-    max_depth: int = 3
-    max_digits: int = 1
-    qty_third_layer = 100000
-    qty_second_layer = 100000
+    max_depth = 3
+    max_digits = 1
+    qty_second_layer = 200000
+    qty_third_layer = 200000
 
 if __name__ == '__main__':
+    # create basic config for logging
+    logging.basicConfig(level=logging.DEBUG)
+
     config = NestedClacConfig()
     first, second, third = generate_data(config)
+    dataset_native = {
+        "first": first,
+        "second": second,
+        "third": third,
+    }
+    
+
     dataset = dict(
         first=[x.to_json_dict() for x in tqdm.tqdm(first)], 
         second=[x.to_json_dict() for x in tqdm.tqdm(second)], 
         third=[x.to_json_dict() for x in tqdm.tqdm(third)],
     )
+    start = time.perf_counter()
+    with open(SCRIPT_DIR / "data" / "dicts.pkl", "bw") as f:
+        pickle.dump(dataset, f)
+    print(f"Pickled dicts in {time.perf_counter() - start:0.2f} seconds")
+
+    start = time.perf_counter()
     with open(SCRIPT_DIR / "data" / config.output_name, "w") as f:
         json.dump(dataset, f)
+    print(f"Dumped json in {time.perf_counter() - start:0.2f} seconds")
