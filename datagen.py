@@ -33,6 +33,7 @@ class Node:
         "_value",
         "_input_str", 
         "_oracle_str", 
+        "_oracle_without_top_val",
     )
 
     def __init__(
@@ -46,14 +47,17 @@ class Node:
         self._value = value
         self._input_str:  Optional[str] = None
         self._oracle_str: Optional[str] = None
+        self._oracle_without_top_val: Optional[str] = None
 
     def to_json_dict(self):
+        oracle_str, oracle_without_top_val = self.get_oracle_str()
         return {
             "op": self.get_op(),
             "children": [child.to_json_dict() for child in self.get_children()] if self.get_children() else None,
             "value": self.get_value(),
             "input_str": self.get_input_str(),
-            "oracle_str": self.get_oracle_str(),
+            "oracle_str": oracle_str,
+            "oracle_without_top_val": oracle_without_top_val,
         }
 
     @classmethod
@@ -68,6 +72,7 @@ class Node:
         )
         node._input_str = json_dict["input_str"]
         node._oracle_str = json_dict["oracle_str"]
+        node._oracle_without_top_val = json_dict["oracle_without_top_val"]
         return node
 
     def get_op(self):
@@ -92,38 +97,58 @@ class Node:
         return self._input_str
 
     def get_oracle_str(self):
-        # Multiple calls should always return the same thing
-        if self._oracle_str is None:
+        """
+        The situation is that if we do generation with the scratch pad fed in,
+        we need to be given the left part of the final top most equation without
+        the right value.
+        """
+        if self._oracle_str is None or self._oracle_without_top_val is None:
             if self.get_children():
                 assert len(self.get_children()) == 2, len(self.get_children())
-                a = self.get_children()[0].get_oracle_str()
-                b = self.get_children()[1].get_oracle_str()
-                self._oracle_str = f"({a} {self._op} {b} = {self.get_value()})"
+                a_str, _ = self.get_children()[0].get_oracle_str()
+                b_str, _ = self.get_children()[1].get_oracle_str()
+                self._oracle_str = f"({a_str} {self._op} {b_str} = {self.get_value()})"
+                self._oracle_without_top_val = f"({a_str} {self._op} {b_str} = "
             else:
                 self._oracle_str = f"{self.get_value()}"
+                self._oracle_without_top_val = ""
             
-        return self._oracle_str
+        return self._oracle_str, self._oracle_without_top_val
 
-    def get_pseudo(self, prediction_function, is_root):
+    def get_pseudo(self, prediction_function, head_type):
         """ 
-        is_root: whether this node is the root of the tree. 
-            Necessary because we need to either put the oracle 
-            answer in the string if it is the root, or nothing at all.
+
+        head_types are eaither "pred" or "oracle".
+        The `head` being the right side of the top most equation.
+        We want a "pred" head if we are composing the pseudo label tree.
+        We want an "oracle" head at the very top, during training.
+        We return "pseudo_without_head" for generation when the scratch pad is fed in.
+
         """
         # Multiple calls will have DIFFERENT RESULTS
 
+        assert head_type in ["pred", "oracle"]
+
         if self.children is not None:
-            a_str, a_pred = self.children[0].get_pseudo(prediction_function, False)
-            b_str, b_pred = self.children[1].get_pseudo(prediction_function, False)
-            if is_root:
-                answer = self.get_value()
+            a_str, _, a_pred = self.children[0].get_pseudo(prediction_function, head_type="pred")
+            b_str, _, b_pred = self.children[1].get_pseudo(prediction_function, head_type="pred")
+            if head_type == "oracle" or head_type == "pred":
+                if head_type == "oracle":
+                    head = self.get_value()
+                elif head_type == "pred":
+                    head = prediction_function(a_pred, b_pred)
+
+                pseudo_without_head = f"({a_str} {self.get_op()} {b_str} = "
+                pseudo_str = f"({a_str} {self.get_op()} {b_str} = {head})"   
             else:
-                answer = prediction_function(a_pred, b_pred)
-            self._pseudo_str = f"({a_str} {self.get_op()} {b_str} = {answer})"
+                raise ValueError(f"Unknown head_type: {head_type}")
         else:
-            self._pseudo_str = f"{self.get_value()}"
-            prediction = self.get_value()
-        return self._pseudo_str, prediction
+            pseudo_str = f"{self.get_value()}"
+            pseudo_without_head = f""
+            # The bottom most node's "prediction" is the real value. Gotta start somewhere.
+            prediction = self.get_value() 
+        
+        return pseudo_str, pseudo_without_head, prediction
 
     def __repr__(self):
         return f"Node({self.get_oracle_str()})"
@@ -251,7 +276,6 @@ if __name__ == '__main__':
         "second": second,
         "third": third,
     }
-    
 
     dataset = dict(
         first=[x.to_json_dict() for x in tqdm.tqdm(first)], 
