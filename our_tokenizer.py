@@ -3,6 +3,20 @@ import numpy as np
 import torch
 
 class Tokenizer:
+    __slots__ = (
+        "vocab",
+        "token_to_idx",
+        "idx_to_token",
+        "bos_token",
+        "eos_token",
+        "pad_token",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "padding_side",
+        "max_length",
+    )
+
     def __init__(self, max_length, use_equal_symbol):
         self.vocab = [
             "<pad>", 
@@ -39,7 +53,7 @@ class Tokenizer:
         self.padding_side = "right"
         self.max_length = max_length
 
-    def tokenize(self, input_str):
+    def encode(self, input_str, return_tensors="np"):
         assert type(input_str) == str, type(input_str)
         output = []
         for char in input_str:
@@ -50,14 +64,25 @@ class Tokenizer:
                     continue
                 else:
                     raise ValueError(f"Unknown token '{char}'")
-        
-        output = np.array(output + [self.token_to_idx["<eos>"]], dtype=np.int64)
+        list_form = output + [self.token_to_idx["<eos>"]]
+
+        if return_tensors is None:
+            output = list_form
+        elif return_tensors == "np":
+            output = np.array(list_form, dtype=np.int64)
+        elif return_tensors == "pt":
+            output = torch.tensor(list_form, dtype=torch.int64)
+        else:
+            raise ValueError(f"Unknown return_tensors value '{return_tensors}'")
         return output
     
-    def decode(self, input_tokens):
+    def decode(self, input_tokens, ignore_special_symbols):
         assert type(input_tokens) == list, type(input_tokens)
         output = []
+        ignore_set = set([self.bos_token_id, self.eos_token_id, self.pad_token_id])
         for token_index in input_tokens:
+            if ignore_special_symbols and token_index in ignore_set:
+                continue
             if isinstance(token_index, int) and token_index >= 0 and token_index < len(self.idx_to_token):
                 output.append(self.idx_to_token[token_index])
             else:
@@ -65,7 +90,7 @@ class Tokenizer:
         
         return " ".join(output)
 
-    def pad(self, features, padding, max_length, pad_to_multiple_of, return_tensors):
+    def pad(self, features, padding, max_length, pad_to_multiple_of, return_tensors="np"):
         """ Pad input_token_ids, create attention_mask, convert everything to tensors.
         Mirrors huggingface tokenizers that way.
         """
@@ -96,12 +121,27 @@ class Tokenizer:
             assert as_set == keys, as_set
         
         if return_tensors == "np":
-            return {k: np.array    ([x[k] for x in padded_sequences], dtype=np   .int64) for k in padded_sequences[0].keys()}
+            output = {}
+            for k in keys:
+                seq = [x[k] for x in padded_sequences]
+                output[k] = np.array(seq, dtype=np.int64)
+            return output
+
         elif return_tensors == "pt":
-            return {k: torch.tensor([x[k] for x in padded_sequences], dtype=torch.int64) for k in padded_sequences[0].keys()}
+            output = {}
+            for k in keys:
+                seq = [x[k] for x in padded_sequences]
+                output[k] = torch.tensor(seq, dtype=torch.int64)
+            return output
+
+        elif return_tensors is None:
+            return {
+                k: [x[k] for x in padded_sequences] 
+                for k in padded_sequences[0].keys()
+            }
 
         else:
             raise ValueError(f"Unknown return_tensors value '{return_tensors}'")
 
-    def __call__(self, input_str):
-        return self.tokenize(input_str)
+    def __call__(self, *args, **kwargs):
+        return self.encode(*args, **kwargs)

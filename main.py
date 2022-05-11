@@ -1,10 +1,19 @@
 print("Importing modules")
+from asyncio.subprocess import PIPE
+import concurrent.futures as futures
 import copy
+import dataclasses
 import logging
 import math
+import multiprocessing.dummy as dummy
+import multiprocessing
+
+import wandb
 from pathlib import Path
 import pickle
+import queue
 import random
+import threading
 import time
 
 from beartype import beartype
@@ -13,8 +22,8 @@ import numpy as np
 import pytorch_lightning as pl
 import rich
 import torch
-import transformers
 from tqdm import tqdm
+import transformers
 from typing import *
 import ujson as json
 
@@ -22,9 +31,11 @@ import pretty_traceback
 pretty_traceback.install()
 
 import datagen
+import our_data_collator
+import our_datasets
 import our_metrics
 import our_tokenizer
-import our_data_collator
+import multi_threaded
 print("Done loading modules")
 
 OUR_DEBUG = True
@@ -32,14 +43,24 @@ SCRIPT_DIR = Path(__file__).absolute().parent
 LOGGER = logging.getLogger(__name__)
 
 
-class ANSWER_MODES:
-    WHOLE_OUTPUT = "whole_output"
-    FINAL_TERM_ONLY = "final_term_only"
-    _VALUES = set([WHOLE_OUTPUT, FINAL_TERM_ONLY])
+#########################################################################################################
+MODE = "per_batch"
+FREEFORM_OPTIONS = [True, False]
+#########################################################################################################
+PIPE_TYPE = multi_threaded.make_thread_safe_pipes
+POOL_CONSTRUCTOR = lambda num_workers: dummy.Pool(processes=num_workers)
+CONC_MODE = "yield"
+LOOP_WAIT_SEC = 0
+BATCH_SIZE = 1024
+MULTIPROCESSING_METHOD = None
+#########################################################################################################
 
-    def check(cls, mode):
-        assert mode in cls._VALUES, f"Unknown mode '{mode}', must be one of {cls._VALUES}"
+def clean_fn(tokens, tokenizer):
+    tokens_list = tokens.cpu().numpy().tolist()
+    tokens_list = [x for x in tokens_list if x != -100]
+    as_string = tokenizer.decode(tokens_list, ignore_special_symbols=False)
 
+    return as_string.replace("<pad>", "[bright_cyan]<p>[/bright_cyan]")
 
 def zip_dicts(*dicts):
     d = {}
@@ -62,96 +83,16 @@ def zip_dicts(*dicts):
         except StopIteration:
             break
 
-class MostBasicDataset(torch.utils.data.Dataset):
-    has_curriculum = False
-
-    def __init__(self, dataset: Dict[str, List[datagen.Node]], tokenizer):
-        self.dataset = dataset["first"] + dataset["second"] + dataset["third"]
-        random.shuffle(self.dataset)
-        self.tokenizer = tokenizer
-        
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        input_ = self.dataset[idx].get_input_str()
-        label = str(self.dataset[idx].get_value())
-        return dict(
-            input_ids=self.tokenizer(input_), 
-            labels=self.tokenizer(label),
-        )
+def prep_return_data(output, decoder_input_ids, tokenizer):
+    assert len(output.shape) == 1, output.shape
+    list_output = output.tolist()
+    list_output_filtered = list_output[len(decoder_input_ids):]
+    good_output = tokenizer.decode(list_output_filtered, ignore_special_symbols=True)
+    if good_output and good_output[-1] == ")":
+        good_output = good_output[:-1]
+    return good_output.replace("<eos>", "").strip()
 
 
-class OracleBasicDataset(torch.utils.data.Dataset):
-    has_curriculum = False
-
-    def __init__(self, dataset: Dict[str, List[datagen.Node]], tokenizer):
-        self.dataset = dataset["first"] + dataset["second"] + dataset["third"]
-        random.shuffle(self.dataset)
-        self.tokenizer = tokenizer
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        encoder_input = self.dataset[idx].get_input_str()
-        label, decoder_input_for_gen = self.dataset[idx].get_oracle_str()
-
-        return dict(
-            input_ids=self.tokenizer(encoder_input), 
-            labels=self.tokenizer(label),
-            decoder_input_ids_for_gen=self.tokenizer(decoder_input_for_gen),
-        )
-
-
-class SelfLearnedBasicDataset(torch.utils.data.Dataset):
-    has_curriculum = False
-
-    def __init__(self, dataset: Dict[str, List[datagen.Node]], tokenizer, pred_fn):
-        self.dataset = dataset["first"] + dataset["second"] + dataset["third"]
-        random.shuffle(self.dataset)
-        self.tokenizer = tokenizer
-        self.pred_fn = pred_fn
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        input_ = self.dataset[idx].get_input_str()
-        pseudo_str, pseudo_without_head, _ = self.dataset[idx].get_pseudo(
-            self.pred_fn, head_type="oracle"
-        )
-
-        return dict(
-            input_ids=self.tokenizer(input_), 
-            labels=self.tokenizer(pseudo_str),
-            decoder_input_ids_for_gen=self.tokenizer(pseudo_without_head),
-        )
-
-
-def load_dataset(json_path, pkl_path):
-
-    LOGGER.debug(f"Reading and parsing dataset from {json_path} or from {pkl_path}")
-
-    if pkl_path:
-        with open(pkl_path, "rb") as f:
-            dicts = pickle.load(f)
-    else:
-        assert json_path
-        with open(json_path) as f:
-            dicts = json.load(f)
-    
-    LOGGER.debug(f"Parsing structures from the dicts.")
-    dataset = {}
-    top_progress = tqdm(dicts.items())
-    for level_name, node_dict_list in top_progress:
-        top_progress.set_description(f"Parsing {level_name}")
-        dataset[level_name] = []
-        for node_dict in tqdm(node_dict_list, desc=level_name):
-            dataset[level_name].append(datagen.Node.from_json_dict(node_dict))
-    
-    LOGGER.debug(f"Done loading dataset.")
-    return dataset
 
 
 class PLBart(pl.LightningModule):
@@ -220,83 +161,83 @@ class PLBart(pl.LightningModule):
 
     def forward(self, *args, **kwargs):
         if "decoder_input_ids_for_gen" in kwargs:
-            del kwargs["decoder_input_ids_for_gen"]
+            kwargs = {
+                k: w for k, w in kwargs.items() 
+                if k != "decoder_input_ids_for_gen" and k != "decoder_attention_mask_for_gen"
+            }
         return self.model(*args, **kwargs)
 
     def training_step(self, batch, batch_idx):
-
         outputs = self(**batch)
         self.log("train_loss", outputs.loss, **self.logging_conf)
         return outputs.loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx):
         # self.allen_ai_bart.training = False
-        
         loss: torch.Tensor = self(**batch).loss
-
-        def clean_fn(tokens):
-            tokens_list = tokens.cpu().numpy().tolist()
-            tokens_list = [x for x in tokens_list if x != -100]
-            as_string = self.tokenizer.decode(tokens_list)
-
-            return as_string.replace("<pad>", "[bright_cyan]<p>[/bright_cyan]")
+        things_to_log = dict(eval_loss=loss)
 
         if batch_idx % 100 == 0:
-            MODE = "per_unit"
             if MODE == "per_batch":
-                assert False
+                generation_kwargs = dict(**self.generation_kwargs)
+                if not is_freeform:
+                    generation_kwargs["decoder_input_ids"] =      batch["decoder_input_ids_for_gen"]
+                    generation_kwargs["decoder_attention_mask"] = batch["decoder_input_ids_for_gen"] != self.tokenizer.pad_token_id
+                    
                 preds: torch.Tensor = self.model.generate(
                     input_ids=              batch["input_ids"], 
                     attention_mask=         batch["attention_mask"], 
-                    decoder_input_ids=      batch["decoder_input_ids_for_gen"],
-                    decoder_attention_mask= batch["decoder_input_ids_for_gen"] != self.tokenizer.pad_token_id,
-                    **self.generation_kwargs, 
+                    **generation_kwargs, 
                 )
                 loop_package = zip(zip_dicts(batch), preds)
+
             elif MODE == "per_unit":
                 loop_package = zip_dicts(batch)
             else:
                 raise ValueError(f"Unknown mode {MODE}")
 
-            freeform_options = [False]
-            if "decoder_input_ids_for_gen" in batch:
-                freeform_options.append(True)
+            em = {k: our_metrics.EM() for k in FREEFORM_OPTIONS}
+            rich.print("[red bold]FIX THE LENGTH SHIT")
+            for i, pack in enumerate(tqdm(loop_package, desc="Validating", total=len(batch["input_ids"]))):
+                do_print = batch_idx == 0 and i < 5
+                
+                if do_print:
+                    rich.print(f"[blue]" + "#" * 80)
 
-            for is_freeform in freeform_options:
-                freeform_maybe = "_freeform" if is_freeform else ""
+                for is_freeform in FREEFORM_OPTIONS:
+                    freeform_maybe = "_freeform" if is_freeform else ""
 
-                em = our_metrics.EM()
-
-                for i, pack in enumerate(tqdm(loop_package)):
                     if i >= self.max_generation_quantity_valid:
                         break
                     
-                    do_print = batch_idx == 0 and i < 5
-
                     if MODE == "per_batch":
                         sample, pred = pack
 
                     if MODE == "per_unit":
                         sample = pack
-                        
                         generation_kwargs = dict(**self.generation_kwargs)
-                        if "decoder_input_ids_for_gen" in pack:
+
+                        if "decoder_input_ids_for_gen" in pack and not is_freeform :
                             filtered = [
                                 x for x in sample["decoder_input_ids_for_gen"] 
                                 if x != self.tokenizer.pad_token_id
                             ]
-                            if is_freeform:
-                                generation_kwargs["decoder_input_ids"] = (
-                                    torch.stack(filtered).reshape(1, -1)
-                                )
 
+                            for x in filtered:
+                                assert x < len(self.tokenizer.vocab), x
+
+                            
+                            generation_kwargs["decoder_input_ids"] = (
+                                torch.stack(filtered).reshape(1, -1)[:, :generation_kwargs["max_length"] - 1]
+                            )
+                        
                         assert sample["input_ids"] is not None
                         assert sample["attention_mask"] is not None
-
+                        
                         pred = self.model.generate(
                             input_ids=sample["input_ids"].reshape(1, -1), 
                             attention_mask=sample["attention_mask"].reshape(1, -1), 
-                            **self.generation_kwargs, 
+                            **generation_kwargs, 
                         )
                         
                         assert len(pred) == 1, pred.shape
@@ -311,24 +252,26 @@ class PLBart(pl.LightningModule):
                     clean_label = cleaned["cleaned_labels"]
                     
                     if do_print:
-                        rich.print(f"[blue]Inputs{freeform_maybe}:         \"{clean_fn(sample['input_ids'])}\"")
-                        if "decoder_input_ids_for_gen" in sample:
-                            rich.print(f"[blue]Decoder Inputs{freeform_maybe}: \"{clean_fn(sample['decoder_input_ids_for_gen'])}\"")
-                        rich.print(f"[blue]Gen{freeform_maybe}:            \"{clean_fn(pred)}\"")
-                        rich.print(f"[blue]Label{freeform_maybe}:          \"{clean_fn(sample['labels'])}")
+                        rich.print(f"[blue]Inputs{freeform_maybe}:         \"{clean_fn(sample['input_ids'], self.tokenizer)}\"")
+                        if "decoder_input_ids_for_gen" in generation_kwargs:
+                            assert len(generation_kwargs['decoder_input_ids']) == 1, generation_kwargs['decoder_input_ids'].shape
+                            rich.print(f"[blue]Decoder Inputs{freeform_maybe}: \"{clean_fn(generation_kwargs['decoder_input_ids'][0], self.tokenizer)}\"")
+                        rich.print(f"[blue]Gen{freeform_maybe}:            \"{clean_fn(pred, self.tokenizer)}\"")
+                        rich.print(f"[blue]Label{freeform_maybe}:          \"{clean_fn(sample['labels'], self.tokenizer)}")
 
-                    em                .add(clean_pred, clean_label, do_print=do_print, descr=freeform_maybe)
+                    em[is_freeform].add(clean_pred, clean_label, do_print=do_print, descr=freeform_maybe)
                 
-                ###############################################################
-                # Compute and print metrics
-                ###############################################################
-                em_acc_val =         em.compute()
-                rich.print(f"[orange]GOT{freeform_maybe} {em.correct}/{em.total} = {em.correct / em.total:.2%}")
-                self.log(f"EM{freeform_maybe}",             em_acc_val,         **self.logging_conf)
-                self.log(f"eval_loss{freeform_maybe}",      loss,               **self.logging_conf)
-
-            # self.allen_ai_bart.training = True
-
+            ###############################################################
+            # Compute and print metrics
+            ###############################################################
+            for is_freeform in FREEFORM_OPTIONS:
+                freeform_maybe = "_freeform" if is_freeform else ""
+                em_acc_val = em[is_freeform].compute()
+                things_to_log[f"EM{freeform_maybe}"] = em_acc_val
+                ratio = em[is_freeform].correct / em[is_freeform].total
+                rich.print(f"[orange]GOT{freeform_maybe} {em[is_freeform].correct}/{em[is_freeform].total} = {ratio:.2%}\n")
+            
+        self.log_dict(things_to_log, **self.logging_conf)
 
     def configure_optimizers(self):
         """
@@ -358,37 +301,175 @@ class PLBart(pl.LightningModule):
 
         return output
 
+    def _make_dataloader(self, ds, batch_size, shuffle, dl_name):
+        collator = our_data_collator.DataCollatorWithDecoderInputIds(
+            self.tokenizer, 
+            model=self.model, 
+        )
 
-    def _make_dataloader(self, ds, batch_size, shuffle):
+        if shuffle:
+            indices = np.random.permutation(len(ds))
+        else:
+            indices = np.arange(len(ds))
+
+        if CONC_MODE != "yield":             
+            yield from multi_threaded.start(
+                indices, 
+                batch_size, 
+                PIPE_TYPE, 
+                dl_name, 
+                ds, 
+                collator, 
+                self.model, 
+                self.tokenizer, 
+                self.generation_kwargs, 
+                LOOP_WAIT_SEC, 
+                POOL_CONSTRUCTOR,
+            )
+        else:
+            for i in tqdm(range(0, len(ds), batch_size), desc=f"progress in {dl_name}"):
+                batch_indices = indices[i:i + batch_size]
+                
+                iterators = [iter(ds.get(i)) for i in batch_indices]
+                send_values = [None] * len(iterators)
+                final_values = [None] * len(iterators)
+                prediction_batch = []
+                prediction_batch_iterator_idx = []
+
+                at_least_one = True
+                iteration_no = 0
+                while at_least_one:
+                    iteration_no += 1
+                    at_least_one = False
+                    for idx, iterator in enumerate(iterators):
+                        # print(f"{iteration_no = } - working on iterator #{idx}")
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        # Ignore this iterator if it is done
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        if final_values[idx] is not None:
+                            continue
+                        
+                        try:
+                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                            # Get the next value from the iterator, no state if first iteration.
+                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                            if send_values[idx] is None:
+                                query = next(iterator)
+                            else:
+                                query = iterator.send(send_values[idx])
+                            
+                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                            # Add to the batch pile, with meta info
+                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                            prediction_batch.append(
+                                dict(
+                                    input_data=datagen.prep_input_data(
+                                        tokenizer=self.tokenizer, 
+                                        input_str=query["input_str"], 
+                                        pseudo_without_head=query["pseudo_without_head"]
+                                    ), 
+                                    logging_info=query["logging_info"],
+                                )
+                            )
+                            # Meta info
+                            prediction_batch_iterator_idx.append(idx)
+                            at_least_one = True
+
+                        except StopIteration as err:
+                            final_value = err.value
+                            final_values[idx] = final_value
+
+                    if prediction_batch:
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        # Prep the inputs
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        without_logging_info = [
+                            dict(input_ids=x["input_data"][0], decoder_input_ids_for_gen=x["input_data"][1]) 
+                            for x in prediction_batch
+                        ]
+                        assert isinstance(without_logging_info[0], dict), type(without_logging_info[0])
+
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        # Do the prediction
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        rich.print(f"[redbold]{len(without_logging_info) = } / {batch_size}")
+                        outputs = multi_threaded.actual_prediction(
+                            batch=without_logging_info,
+                            collator=collator, 
+                            model=self.model, 
+                            tokenizer=self.tokenizer, 
+                            generation_kwargs=self.generation_kwargs,
+                        )
+
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        # Prep the outputs
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        for idx, output, input_data in zip(
+                            prediction_batch_iterator_idx, 
+                            outputs, 
+                            without_logging_info
+                        ):
+                            send_values[idx] = prep_return_data(
+                                output, 
+                                decoder_input_ids=input_data["decoder_input_ids_for_gen"], 
+                                tokenizer=self.tokenizer
+                            )
+
+                        prediction_batch = []
+                        prediction_batch_iterator_idx = []
+
+                num_nones = sum(x is None for x in final_values)
+                assert num_nones == 0, f"{num_nones}/{len(final_values)} were None"
+                
+                yield collator(final_values)
+
+    @beartype
+    def _make_regular_dataloader(
+        self, 
+        ds: Union[our_datasets.MostBasicDataset, our_datasets.OracleBasicDataset, our_datasets.SelfLearnedBasicDataset], 
+        batch_size: int, 
+        shuffle: bool,
+    ):
         return torch.utils.data.DataLoader(
-            ds, 
-            collate_fn=our_data_collator.DataCollatorWithDecoderInputIds(
-                self.tokenizer, model=self.model, 
-            ), 
-            batch_size=batch_size, 
-            num_workers=self.num_workers_dl,
-            shuffle=shuffle,
-        ) 
+                ds, 
+                collate_fn=our_data_collator.DataCollatorWithDecoderInputIds(
+                    self.tokenizer, 
+                    model=self.model, 
+                ), 
+                batch_size=batch_size, 
+                num_workers=self.num_workers_dl,
+                shuffle=shuffle,
+            ) 
 
     def train_dataloader(self):
-        return self._make_dataloader(
-            self.train_ds, 
-            self.batch_size,
-            shuffle=False,
-        )
+        if isinstance(self.train_ds, our_datasets.SelfLearnedBasicDataset):
+            return self._make_dataloader(
+                self.train_ds, 
+                self.batch_size,
+                shuffle=True,
+                dl_name="train_dl"
+            )
+        else:
+            return self._make_regular_dataloader(
+                ds=self.train_ds,
+                batch_size=self.batch_size,
+                shuffle=True,
+            )
 
     def val_dataloader(self):
-        return self._make_dataloader(
-            self.eval_ds,
-            self.eval_batch_size,
-            shuffle=False
-        )
-        
-DATASET_TYPES = dict(
-    most_basic_dataset=MostBasicDataset,
-    oracle_basic_dataset=OracleBasicDataset,
-    self_learned_basic_dataset=SelfLearnedBasicDataset,
-)
+        if isinstance(self.eval_ds, our_datasets.SelfLearnedBasicDataset):
+            return self._make_dataloader(
+                self.eval_ds, 
+                self.batch_size,
+                shuffle=True,
+                dl_name="val_dl"
+            )
+        else:
+            return self._make_regular_dataloader(
+                ds=self.eval_ds,
+                batch_size=self.batch_size,
+                shuffle=True,
+            )
 
 def main(
     run_name="oracle",
@@ -397,25 +478,28 @@ def main(
     dicts_path=SCRIPT_DIR / "data" / "dicts.pkl",
 ):
     
+    if MULTIPROCESSING_METHOD:
+        multiprocessing.set_start_method(MULTIPROCESSING_METHOD)
+    
     LEARNING_RATE = 0.001
     NUM_GPUS = 1
     
     EVAL_EVERY_N_EPOCHS = 2
     WANDB_ENTITY = "julesgm"
     WANDB_PROJECT = "self_learned_explanations"
-    TRAIN_BATCH_SIZE = 1024
-    MAX_GENERATION_QUANTITY_VALID = 128
+    TRAIN_BATCH_SIZE = BATCH_SIZE
+    MAX_GENERATION_QUANTITY_VALID = min(128, TRAIN_BATCH_SIZE)
     EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE
     GENERATION_MAX_LENGTH = 64
     PRECISION = 16
     GRADIENT_CLIP_VAL = 0.1
 
-    dataset = load_dataset(dataset_path, dicts_path)
+    dataset = datagen.load_dataset(dataset_path, dicts_path)
     train_ds = {k: v[:len(v) // 2] for k, v in dataset.items()}
     valid_ds = {k: v[len(v) // 2:] for k, v in dataset.items()}
     tokenizer = our_tokenizer.Tokenizer(max_length=1024, use_equal_symbol=True)
-    train_torch_dataset = DATASET_TYPES[dataset_type](train_ds, tokenizer)
-    valid_torch_dataset = DATASET_TYPES[dataset_type](valid_ds, tokenizer)
+    train_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](train_ds, tokenizer)
+    valid_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](valid_ds, tokenizer)
 
     ###############################################################
     # Should never change
@@ -449,6 +533,12 @@ def main(
     model = transformers.BartForConditionalGeneration(
         config
     )
+    
+    functor = multi_threaded.SendPullPredFunctor(tokenizer)
+    if isinstance(train_torch_dataset, our_datasets.SelfLearnedBasicDataset):
+        train_torch_dataset.set_pred_functor(functor, CONC_MODE)
+    if isinstance(valid_torch_dataset, our_datasets.SelfLearnedBasicDataset):
+        valid_torch_dataset.set_pred_functor(functor, CONC_MODE)
 
     pl_object = PLBart(
         model=model, 
@@ -472,9 +562,9 @@ def main(
         curriculum_instance=None,
         max_generation_quantity_valid=MAX_GENERATION_QUANTITY_VALID,
     )
-
-    trainer = pl.Trainer(
-        logger=pl.loggers.WandbLogger(
+    try:
+        logger = pl.loggers.WandbLogger(
+            settings=wandb.Settings(start_method="thread"),
             project=WANDB_PROJECT, 
             name=run_name, 
             entity=WANDB_ENTITY,
@@ -489,7 +579,12 @@ def main(
                 precision=PRECISION,
                 bart_config=vars(config)
             )
-        ),
+        )
+    except ConnectionRefusedError:
+        logger = None
+
+    trainer = pl.Trainer(
+        logger=logger,
         gradient_clip_val=GRADIENT_CLIP_VAL,
         precision=PRECISION,
         max_epochs=1000, 

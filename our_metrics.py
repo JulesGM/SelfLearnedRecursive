@@ -6,22 +6,30 @@ import rich
 import torch
 import numpy as np
 
+import our_tokenizer
+
 class OurMetric(abc.ABC):
     @classmethod
-    def prepare(cls, tokenizer, pred, label, do_print):
+    def prepare(cls, tokenizer: our_tokenizer.Tokenizer, pred, label, do_print):
         things_to_ignore = {
             -100, 
             tokenizer.pad_token_id, 
             tokenizer.bos_token_id, 
-            tokenizer.eos_token_id
+            tokenizer.eos_token_id,
         }
         
         assert 0 in things_to_ignore, things_to_ignore
         assert 1 in things_to_ignore, things_to_ignore
         assert 2 in things_to_ignore, things_to_ignore
+        
+        pred = pred.cpu().numpy().tolist()
+        label = label.cpu().numpy().tolist()
 
-        cleaned_preds = [x for x in  pred.cpu().numpy().tolist() if x not in things_to_ignore]
-        cleaned_labels = [x for x in label.cpu().numpy().tolist() if x not in things_to_ignore]
+        if pred[:2] == [tokenizer.bos_token_id] * 2:
+            pred[:2] = [tokenizer.bos_token_id, tokenizer.token_to_idx["("]]
+
+        cleaned_preds = [x for x in  pred if x not in things_to_ignore]
+        cleaned_labels = [x for x in label if x not in things_to_ignore]
 
         return dict(
             cleaned_preds=cleaned_preds, 
@@ -67,49 +75,49 @@ class EM(OurMetric):
         return self.correct / self.total
 
 
-class RecallAcc:
-    def __init__(self):
-        self.recall_accuracies = []
+# class RecallAcc:
+#     def __init__(self):
+#         self.recall_accuracies = []
 
-    @beartype
-    def add(self, pred: list, label: list, do_print: bool = False, descr=""):
-        recall_acc_decoded = list(pred)
-        recall_acc_label = list(label)
+#     @beartype
+#     def add(self, pred: list, label: list, do_print: bool = False, descr=""):
+#         recall_acc_decoded = list(pred)
+#         recall_acc_label = list(label)
 
-        if len(recall_acc_decoded) < len(recall_acc_label):
-            recall_acc_decoded += [0] * (len(recall_acc_label) - len(recall_acc_decoded))
-        elif len(recall_acc_decoded) > len(recall_acc_label):
-            recall_acc_decoded = recall_acc_decoded[:len(recall_acc_label)]
+#         if len(recall_acc_decoded) < len(recall_acc_label):
+#             recall_acc_decoded += [0] * (len(recall_acc_la el) - len(recall_acc_decoded))
+#         elif len(recall_acc_decoded) > len(recall_acc_label):
+#             recall_acc_decoded = recall_acc_decoded[:len(recall_acc_label)]
 
-        recall_acc_label_np =   np.array(recall_acc_label,   dtype=np.int64)
-        recall_acc_decoded_np = np.array(recall_acc_decoded, dtype=np.int64)
-        recall_acc =            np.mean(recall_acc_decoded_np == recall_acc_label_np)
+#         recall_acc_label_np =   np.array(recall_acc_label,   dtype=np.int64)
+#         recall_acc_decoded_np = np.array(recall_acc_decoded, dtype=np.int64)
+#         recall_acc =            np.mean(recall_acc_decoded_np == recall_acc_label_np)
 
-        self.recall_accuracies.append(recall_acc)
+#         self.recall_accuracies.append(recall_acc)
 
-    def compute(self):
-        return np.mean(self.recall_accuracies)
+#     def compute(self):
+#         return np.mean(self.recall_accuracies)
 
 
-class PrecisionAcc:
-    def __init__(self): 
-        self.precision_accuracies = []
+# class PrecisionAcc:
+#     def __init__(self): 
+#         self.precision_accuracies = []
 
-    @beartype
-    def add(self, pred: list, label: list, do_print: bool = False, descr=""):
-        precision_acc_decoded = list(pred)
-        precision_acc_label = list(label)
+#     @beartype
+#     def add(self, pred: list, label: list, do_print: bool = False, descr=""):
+#         precision_acc_decoded = list(pred)
+#         precision_acc_label = list(label)
 
-        if len(precision_acc_decoded) > len(precision_acc_label):
-            precision_acc_label += [0] * (len(precision_acc_decoded) - len(precision_acc_label))
-        elif len(precision_acc_decoded) < len(precision_acc_label):
-            precision_acc_label = precision_acc_label[:len(precision_acc_decoded)]
+#         if len(precision_acc_decoded) > len(precision_acc_label):
+#             precision_acc_label += [0] * (len(precision_acc_decoded) - len(precision_acc_label))
+#         elif len(precision_acc_decoded) < len(precision_acc_label):
+#             precision_acc_label = precision_acc_label[:len(precision_acc_decoded)]
 
-        precision_acc_label_np =   np.array(precision_acc_label,   dtype=np.int64)
-        precision_acc_decoded_np = np.array(precision_acc_decoded, dtype=np.int64)
-        precision_acc =            np.mean(precision_acc_decoded_np == precision_acc_label_np) 
+#         precision_acc_label_np =   np.array(precision_acc_label,   dtype=np.int64)
+#         precision_acc_decoded_np = np.array(precision_acc_decoded, dtype=np.int64)
+#         precision_acc =            np.mean(precision_acc_decoded_np == precision_acc_label_np) 
 
-        self.precision_accuracies.append(precision_acc) 
+#         self.precision_accuracies.append(precision_acc) 
 
-    def compute(self): 
-        return np.mean(self.precision_accuracies)
+#     def compute(self): 
+#         return np.mean(self.precision_accuracies)

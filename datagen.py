@@ -1,19 +1,24 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import concurrent.futures as futures
 import dataclasses
 import logging
 import math
 from pathlib import Path
 import pickle
 import time
+from typing import *
 
+from beartype import beartype
 import numpy as np
 import random
 import rich
-import tqdm
+from tqdm import tqdm
 from typing import *
 import ujson as json
+
+import our_tokenizer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +30,41 @@ opmap = {
     "-": lambda x, y: x - y,
     "/": lambda x, y: x // y,
 }
+
+@beartype
+def prep_input_data(
+    tokenizer: our_tokenizer.Tokenizer, 
+    input_str: str, 
+    pseudo_without_head: str
+) -> Tuple[np.ndarray, np.ndarray]:
+    input_ids = tokenizer(input_str)
+    decoder_input_ids = tokenizer(pseudo_without_head)
+    return input_ids, decoder_input_ids
+
+
+def load_dataset(json_path, pkl_path):
+
+    LOGGER.debug(f"Reading and parsing dataset from {json_path} or from {pkl_path}")
+
+    if pkl_path:
+        with open(pkl_path, "rb") as f:
+            dicts = pickle.load(f)
+    else:
+        assert json_path
+        with open(json_path) as f:
+            dicts = json.load(f)
+    
+    LOGGER.debug(f"Parsing structures from the dicts.")
+    dataset = {}
+    top_progress = tqdm(dicts.items())
+    for level_name, node_dict_list in top_progress:
+        top_progress.set_description(f"Parsing {level_name}")
+        dataset[level_name] = []
+        for node_dict in tqdm(node_dict_list, desc=level_name):
+            dataset[level_name].append(Node.from_json_dict(node_dict))
+    
+    LOGGER.debug(f"Done loading dataset.")
+    return dataset
 
 class Node:
     __slots__ = (
@@ -115,7 +155,7 @@ class Node:
             
         return self._oracle_str, self._oracle_without_top_val
 
-    def get_pseudo(self, prediction_function, head_type):
+    def get_pseudo(self, prediction_function: Callable, head_type: str, conc_mode: str, logging_info: "PredLogger"):
         """ 
 
         head_types are eaither "pred" or "oracle".
@@ -129,26 +169,85 @@ class Node:
 
         assert head_type in ["pred", "oracle"]
 
-        if self.children is not None:
-            a_str, _, a_pred = self.children[0].get_pseudo(prediction_function, head_type="pred")
-            b_str, _, b_pred = self.children[1].get_pseudo(prediction_function, head_type="pred")
+        if self.get_children() is not None:
+            if conc_mode == "pool":
+                with futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    a_prom = pool.submit(
+                        self.get_children()[0].get_pseudo, 
+                        prediction_function, 
+                        head_type="pred", 
+                        conc_mode=conc_mode, 
+                        logging_info=logging_info
+                    )
+                    b_prom = pool.submit(
+                        self.get_children()[1].get_pseudo, 
+                        prediction_function, 
+                        head_type="pred", 
+                        conc_mode=conc_mode, 
+                        logging_info=logging_info,
+                    )
+                    
+                    a_str, _ = a_prom.result()
+                    b_str, _ = b_prom.result()
+            elif conc_mode == "yield":
+                a_str, _ = yield from self.get_children()[0].get_pseudo(
+                    prediction_function, 
+                    head_type="pred", 
+                    conc_mode=conc_mode, 
+                    logging_info=logging_info
+                )
+                b_str, _ = yield from self.get_children()[1].get_pseudo(
+                    prediction_function, 
+                    head_type="pred", 
+                    conc_mode=conc_mode, 
+                    logging_info=logging_info
+                )
+            elif conc_mode is None:
+                a_str, _ = self.get_children()[0].get_pseudo(
+                    prediction_function, 
+                    head_type="pred", 
+                    conc_mode=conc_mode, 
+                    logging_info=logging_info
+                )
+                b_str, _ = self.get_children()[1].get_pseudo(
+                    prediction_function, 
+                    head_type="pred", 
+                    conc_mode=conc_mode, 
+                    logging_info=logging_info
+                )
+            else:
+                raise ValueError(f"Unknown conc_mode: {conc_mode}")
+
             if head_type == "oracle" or head_type == "pred":
+                pseudo_without_head = f"({a_str} {self.get_op()} {b_str} = "                
                 if head_type == "oracle":
                     head = self.get_value()
                 elif head_type == "pred":
-                    head = prediction_function(a_pred, b_pred)
+                    
+                    if conc_mode == "yield":
+                        head = yield dict(
+                            input_str=self.get_input_str(), 
+                            pseudo_without_head=pseudo_without_head,
+                            logging_info=logging_info,    
+                        )
+                    else:
+                        head = prediction_function(
+                            self.get_input_str(), 
+                            pseudo_without_head,
+                            logging_info,    
+                        )
 
-                pseudo_without_head = f"({a_str} {self.get_op()} {b_str} = "
                 pseudo_str = f"({a_str} {self.get_op()} {b_str} = {head})"   
             else:
                 raise ValueError(f"Unknown head_type: {head_type}")
         else:
             pseudo_str = f"{self.get_value()}"
             pseudo_without_head = f""
-            # The bottom most node's "prediction" is the real value. Gotta start somewhere.
-            prediction = self.get_value() 
         
-        return pseudo_str, pseudo_without_head, prediction
+        assert isinstance(pseudo_str, str), type(pseudo_str)
+        assert isinstance(pseudo_without_head, str), type(pseudo_without_head)
+        return pseudo_str, pseudo_without_head
+
 
     def __repr__(self):
         return f"Node({self.get_oracle_str()})"
@@ -250,7 +349,19 @@ def generate_data(config: "NestedClacConfig") -> Tuple[List[Node], List[Node], L
     print(f"\tthird_l: {len(third_l)}")
 
     return first_l, second_l, third_l
-    
+
+
+@dataclasses.dataclass(frozen=True)
+class PredLogger:
+    __slots__ = ("root",)
+    root: "Node"
+
+    def log_doing(self, input_str: str, current_results: str):
+        root_str = self.root.get_input_str()
+        current_str = input_str
+        highlighted = root_str.replace(current_str, f"[green bold]{current_str}[/green bold]")
+        return f"{highlighted}"
+
 
 @dataclasses.dataclass
 class NestedClacConfig:
@@ -278,9 +389,9 @@ if __name__ == '__main__':
     }
 
     dataset = dict(
-        first=[x.to_json_dict() for x in tqdm.tqdm(first)], 
-        second=[x.to_json_dict() for x in tqdm.tqdm(second)], 
-        third=[x.to_json_dict() for x in tqdm.tqdm(third)],
+        first=[x.to_json_dict() for x in tqdm(first)], 
+        second=[x.to_json_dict() for x in tqdm(second)], 
+        third=[x.to_json_dict() for x in tqdm(third)],
     )
     start = time.perf_counter()
     with open(SCRIPT_DIR / "data" / "dicts.pkl", "bw") as f:
