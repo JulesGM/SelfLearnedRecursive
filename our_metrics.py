@@ -62,11 +62,11 @@ class EM(OurMetric):
         if do_print:            
             rich.print(f"(EM) Answer - {descr}: " + ", ".join(
                 [f"[green]{a}" if a == b else f"[red]{a}" for a, b 
-                in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="")]
+                in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="") if a]
             ))
-            rich.print(f"(EM) Label - {descr}:   " + ", ".join(
+            rich.print(f"(EM) Label  - {descr}: " + ", ".join(
                 [f"[green]{b}" if a == b else f"[red]{b}" for a, b 
-                in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="")]
+                in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="") if b]
             ))
 
         self.total += 1 

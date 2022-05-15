@@ -35,6 +35,7 @@ import our_data_collator
 import our_datasets
 import our_metrics
 import our_tokenizer
+import modded_bart
 import multi_threaded
 print("Done loading modules")
 
@@ -42,10 +43,11 @@ OUR_DEBUG = True
 SCRIPT_DIR = Path(__file__).absolute().parent
 LOGGER = logging.getLogger(__name__)
 
-
 #########################################################################################################
 MODE = "per_batch"
-FREEFORM_OPTIONS = [True, False]
+USE_CACHE = False  # Currently doesn't work, because of the way the positional embeddings are calculated.
+FREEFORM_OPTIONS = [False, True]
+NUM_BATCHES_VALID = 30
 #########################################################################################################
 PIPE_TYPE = multi_threaded.make_thread_safe_pipes
 POOL_CONSTRUCTOR = lambda num_workers: dummy.Pool(processes=num_workers)
@@ -55,14 +57,21 @@ BATCH_SIZE = 1024
 MULTIPROCESSING_METHOD = None
 #########################################################################################################
 
-def clean_fn(tokens, tokenizer):
+
+def clean_sample_for_logging(tokens, tokenizer):
     tokens_list = tokens.cpu().numpy().tolist()
     tokens_list = [x for x in tokens_list if x != -100]
+
     as_string = tokenizer.decode(tokens_list, ignore_special_symbols=False)
 
     return as_string.replace("<pad>", "[bright_cyan]<p>[/bright_cyan]")
 
+
 def zip_dicts(*dicts):
+    """
+    Zips the iterables in the values of the dicts by returning a dict with 
+    the same keys and a set of value at each iteration.
+    """
     d = {}
     for d_ in dicts:
         for k in d_.keys():
@@ -83,6 +92,7 @@ def zip_dicts(*dicts):
         except StopIteration:
             break
 
+
 def prep_return_data(output, decoder_input_ids, tokenizer):
     assert len(output.shape) == 1, output.shape
     list_output = output.tolist()
@@ -91,8 +101,6 @@ def prep_return_data(output, decoder_input_ids, tokenizer):
     if good_output and good_output[-1] == ")":
         good_output = good_output[:-1]
     return good_output.replace("<eos>", "").strip()
-
-
 
 
 class PLBart(pl.LightningModule):
@@ -179,17 +187,20 @@ class PLBart(pl.LightningModule):
 
         if batch_idx % 100 == 0:
             if MODE == "per_batch":
-                generation_kwargs = dict(**self.generation_kwargs)
-                if not is_freeform:
-                    generation_kwargs["decoder_input_ids"] =      batch["decoder_input_ids_for_gen"]
-                    generation_kwargs["decoder_attention_mask"] = batch["decoder_input_ids_for_gen"] != self.tokenizer.pad_token_id
-                    
-                preds: torch.Tensor = self.model.generate(
-                    input_ids=              batch["input_ids"], 
-                    attention_mask=         batch["attention_mask"], 
-                    **generation_kwargs, 
-                )
-                loop_package = zip(zip_dicts(batch), preds)
+                preds = {}
+                for is_freeform in FREEFORM_OPTIONS:
+                    generation_kwargs = dict(**self.generation_kwargs)
+                    if not is_freeform:
+                        generation_kwargs["decoder_input_ids"] =      batch["decoder_input_ids_for_gen"]
+                        # generation_kwargs["decoder_attention_mask"] = batch["decoder_input_ids_for_gen"] != self.tokenizer.pad_token_id
+                        
+                    preds[is_freeform] = self.model.generate(
+                        input_ids=              batch["input_ids"], 
+                        attention_mask=         batch["attention_mask"], 
+                        **generation_kwargs, 
+                    )
+
+                    loop_package = zip_dicts(batch)
 
             elif MODE == "per_unit":
                 loop_package = zip_dicts(batch)
@@ -211,7 +222,8 @@ class PLBart(pl.LightningModule):
                         break
                     
                     if MODE == "per_batch":
-                        sample, pred = pack
+                        sample = pack
+                        pred = preds[is_freeform][i]
 
                     if MODE == "per_unit":
                         sample = pack
@@ -252,12 +264,12 @@ class PLBart(pl.LightningModule):
                     clean_label = cleaned["cleaned_labels"]
                     
                     if do_print:
-                        rich.print(f"[blue]Inputs{freeform_maybe}:         \"{clean_fn(sample['input_ids'], self.tokenizer)}\"")
+                        rich.print(f"[blue]Inputs{freeform_maybe}:         \"{clean_sample_for_logging(sample['input_ids'], self.tokenizer)}\"")
                         if "decoder_input_ids_for_gen" in generation_kwargs:
                             assert len(generation_kwargs['decoder_input_ids']) == 1, generation_kwargs['decoder_input_ids'].shape
-                            rich.print(f"[blue]Decoder Inputs{freeform_maybe}: \"{clean_fn(generation_kwargs['decoder_input_ids'][0], self.tokenizer)}\"")
-                        rich.print(f"[blue]Gen{freeform_maybe}:            \"{clean_fn(pred, self.tokenizer)}\"")
-                        rich.print(f"[blue]Label{freeform_maybe}:          \"{clean_fn(sample['labels'], self.tokenizer)}")
+                            rich.print(f"[blue]Decoder Inputs{freeform_maybe}: \"{clean_sample_for_logging(generation_kwargs['decoder_input_ids'][0], self.tokenizer)}\"")
+                        rich.print(f"[blue]Gen{freeform_maybe}:            \"{clean_sample_for_logging(pred, self.tokenizer)}\"")
+                        rich.print(f"[blue]Label{freeform_maybe}:          \"{clean_sample_for_logging(sample['labels'], self.tokenizer)}")
 
                     em[is_freeform].add(clean_pred, clean_label, do_print=do_print, descr=freeform_maybe)
                 
@@ -484,13 +496,13 @@ def main(
     LEARNING_RATE = 0.001
     NUM_GPUS = 1
     
-    EVAL_EVERY_N_EPOCHS = 2
+    EVAL_EVERY_N_EPOCHS = 1
     WANDB_ENTITY = "julesgm"
     WANDB_PROJECT = "self_learned_explanations"
     TRAIN_BATCH_SIZE = BATCH_SIZE
     MAX_GENERATION_QUANTITY_VALID = min(128, TRAIN_BATCH_SIZE)
     EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE
-    GENERATION_MAX_LENGTH = 64
+    GENERATION_MAX_LENGTH = 90
     PRECISION = 16
     GRADIENT_CLIP_VAL = 0.1
 
@@ -530,7 +542,9 @@ def main(
         f"config.max_position_embeddings={config.max_position_embeddings}"
     )
 
-    model = transformers.BartForConditionalGeneration(
+    # The only difference is that we take decoder_attention_masks into account
+    # for positional embeddings
+    model = modded_bart.ModifiedBartForConditionalGeneration(
         config
     )
     
@@ -551,6 +565,7 @@ def main(
         generation_kwargs=dict(
             max_length=GENERATION_MAX_LENGTH,
             min_length=0,
+            use_cache=USE_CACHE
         ),
         learning_rate=LEARNING_RATE,
         is_adamw=True,
@@ -564,7 +579,6 @@ def main(
     )
     try:
         logger = pl.loggers.WandbLogger(
-            settings=wandb.Settings(start_method="thread"),
             project=WANDB_PROJECT, 
             name=run_name, 
             entity=WANDB_ENTITY,
@@ -591,7 +605,7 @@ def main(
         gpus=NUM_GPUS,
         # val_check_interval=1000,
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
-        limit_val_batches=300,
+        limit_val_batches=NUM_BATCHES_VALID,
     )
     trainer.fit(pl_object)
     

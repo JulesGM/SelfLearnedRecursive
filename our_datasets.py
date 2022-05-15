@@ -94,7 +94,7 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
             decoder_input_ids_for_gen=self.tokenizer(pseudo_without_head),
         )
         end = time.perf_counter()
-        rich.print(f"[green]Took {end - start} seconds to get item {idx}")
+        # rich.print(f"[green]Took {end - start} seconds to get item {idx}")
         return ouptut
 
     def set_pred_functor(self, pred_functor, conc_mode):
