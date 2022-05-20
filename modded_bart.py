@@ -25,6 +25,7 @@
 ########################################################################################################################
 
 """ PyTorch BART model."""
+from dataclasses import dataclass
 import logging
 import math
 import random
@@ -33,8 +34,10 @@ from typing import *
 import rich
 import torch
 from torch import nn
-
 import transformers.models.bart.modeling_bart as original
+
+import pretty_traceback
+pretty_traceback.install()
 
 
 logger = logging.getLogger(__name__)
@@ -52,25 +55,52 @@ class ModifiedBartLearnedPositionalEmbedding(nn.Embedding):
 
     def forward(
         self, 
+        *,
         input_ids_shape: torch.Size, 
         past_key_values_length: int, 
         attention_mask: torch.Tensor, 
         input_ids: torch.Tensor,
         padding_idx: int,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
 
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # All of this is changed
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Original line: Arange starting at the position where the the forward function is in the sequence.
-        fake_attention_mask = input_ids != padding_idx
-        positions = fake_attention_mask.cumsum(dim=-1) + past_key_values_length - 1
-        output = super().forward(positions + self.offset)
+        # We should always have an attention mask at this point.
+        assert attention_mask is not None
+
+        # In order to work with cache (which is when past_key_values_length is not None), we need to
+        # have position_ids given to us because we can't compute them.
+        if past_key_values_length != 0:
+            assert(position_ids is not None) 
+
+        # If we don't have position_ids, we need to compute them
+        if position_ids is None:
+            assert past_key_values_length == 0, past_key_values_length
+            position_ids = attention_mask.cumsum(dim=-1) - 1
+            position_ids.masked_fill_(position_ids < 0, 0) # Prevent negative positions
+
+        # If we already had position_ids, they would also be use here.
+        output = super().forward(position_ids + self.offset)
         return output
 
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    """
+    Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+    """
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+
+    inverted_mask = 1.0 - expanded_mask
+
+    return inverted_mask.masked_fill(inverted_mask.bool(), float("-inf"))
 
 class ModifiedBartDecoder(original.BartDecoder):
     """
@@ -95,16 +125,38 @@ class ModifiedBartDecoder(original.BartDecoder):
         else:
             self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model, self.padding_idx)
 
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Name changed
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         self.embed_positions = ModifiedBartLearnedPositionalEmbedding(
             config.max_position_embeddings,
             config.d_model,
         )
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         self.layers = nn.ModuleList([original.BartDecoderLayer(config) for _ in range(config.decoder_layers)])
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = original._make_causal_mask(
+                input_shape, inputs_embeds.dtype, past_key_values_length=past_key_values_length
+            ).to(self.device)
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+
+        return combined_attention_mask
 
     def forward(
         self,
@@ -120,6 +172,12 @@ class ModifiedBartDecoder(original.BartDecoder):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
+        # Modified by us
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        decoder_position_ids: Optional[torch.LongTensor] = None,
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     ) -> Union[Tuple, original.BaseModelOutputWithPastAndCrossAttentions]:
         r"""
         Args:
@@ -217,16 +275,16 @@ class ModifiedBartDecoder(original.BartDecoder):
             inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
 
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
         # Added by us. 
-        # Add an attention mask if there are decoder inputs and we haven't been passed a mask.
+        # Either we get passed an attention mask by generation, or we generate one when 
+        # the user calls forward on the whole sentence.
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # if attention_mask is None and input_shape[1] > 1:
-        #     attention_mask = input_ids != self.config.pad_token_id
-        #     rich.print("[green bold]CREATED, {input_shape = }")
-        # else:
-        #     rich.print(f"[red bold]DIDN'T CREATE, {input_shape = } {past_key_values_length = }")
+        if past_key_values_length == 0:
+            attention_mask = input_ids != self.config.pad_token_id
 
-        attention_mask = input_ids != self.config.pad_token_id
+        assert attention_mask is not None
+
         un_prepared_attention_mask = attention_mask
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         attention_mask = self._prepare_decoder_attention_mask(
@@ -242,18 +300,16 @@ class ModifiedBartDecoder(original.BartDecoder):
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Modified by us
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        
         positions = self.embed_positions(
-            input_shape, 
-            past_key_values_length, 
-            un_prepared_attention_mask,
-            input_ids,
-            self.padding_idx
+            input_ids_shape=input_shape, 
+            past_key_values_length=past_key_values_length, 
+            attention_mask=un_prepared_attention_mask,
+            input_ids=input_ids,
+            padding_idx=self.padding_idx,
+            position_ids=decoder_position_ids,
         )
 
-        assert past_key_values_length == 0, past_key_values_length
-        assert not use_cache, use_cache
-        assert inputs_embeds.shape == positions.shape, f"{inputs_embeds.shape} != {positions.shape}"
+        # assert inputs_embeds.shape == positions.shape, f"{inputs_embeds.shape} != {positions.shape}"
 
         hidden_states = inputs_embeds + positions
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -370,6 +426,101 @@ class ModifiedBartModel(original.BartModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
+        # Added by me
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        decoder_position_ids: Optional[torch.LongTensor] = None,
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ) -> Union[Tuple, original.Seq2SeqModelOutput]:
+
+        # different to other models, Bart automatically creates decoder_input_ids from
+        # input_ids if no decoder_input_ids are provided
+        if decoder_input_ids is None and decoder_inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError(
+                    "If no `decoder_input_ids` or `decoder_inputs_embeds` are "
+                    "passed, `input_ids` cannot be `None`. Please pass either "
+                    "`input_ids` or `decoder_input_ids` or `decoder_inputs_embeds`."
+                )
+
+            decoder_input_ids = original.shift_tokens_right(
+                input_ids, self.config.pad_token_id, self.config.decoder_start_token_id
+            )
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if encoder_outputs is None:
+            encoder_outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
+        elif return_dict and not isinstance(encoder_outputs, original.BaseModelOutput):
+            encoder_outputs = original.BaseModelOutput(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
+            )
+
+        # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_outputs[0],
+            encoder_attention_mask=attention_mask,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            decoder_position_ids=decoder_position_ids,
+        )
+
+        if not return_dict:
+            return decoder_outputs + encoder_outputs
+
+        return original.Seq2SeqModelOutput(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
 
 class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration):
     """
@@ -383,25 +534,384 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
 
         # Initialize weights and apply final processing
         self.post_init()
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        decoder_input_ids: Optional[torch.LongTensor] = None,
+        decoder_attention_mask: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        decoder_head_mask: Optional[torch.Tensor] = None,
+        cross_attn_head_mask: Optional[torch.Tensor] = None,
+        encoder_outputs: Optional[List[torch.FloatTensor]] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        decoder_inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
+        # Added by me
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        decoder_position_ids: Optional[torch.LongTensor] = None,
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    ) -> Union[Tuple, original.Seq2SeqLMOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        Returns:
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if labels is not None:
+            if use_cache:
+                logger.warning("The `use_cache` argument is changed to `False` since `labels` is provided.")
+            use_cache = False
+            if decoder_input_ids is None and decoder_inputs_embeds is None:
+                decoder_input_ids = original.shift_tokens_right(
+                    labels, self.config.pad_token_id, self.config.decoder_start_token_id
+                )
+
+        outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            encoder_outputs=encoder_outputs,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Jules
+            # Added by me
+            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            decoder_position_ids=decoder_position_ids,
+            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        )
+        lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
+
+        masked_lm_loss = None
+        if labels is not None:
+            loss_fct = original.CrossEntropyLoss()
+            masked_lm_loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (lm_logits,) + outputs[1:]
+            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+
+        return original.Seq2SeqLMOutput(
+            loss=masked_lm_loss,
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        decoder_input_ids,
+        past=None,
+        attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
+        cross_attn_head_mask=None,
+        use_cache=None,
+        encoder_outputs=None,
+        **kwargs
+    ):
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules.
+        # Some checks for things that should not happen.
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        assert head_mask is None, head_mask
+        assert decoder_head_mask is None
+        assert cross_attn_head_mask is None
+        decoder_attention_mask = decoder_input_ids != self.model.config.pad_token_id
+        assert kwargs == {}, kwargs
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules.
+        # If we're using a cache, we can't compute the position_ids from
+        # the decoder_input_ids inside of the forward call, because 
+        # we don't have the decoder_input_ids for that.
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if decoder_attention_mask is not None and past:
+            decoder_position_ids = decoder_attention_mask.cumsum(dim= - 1) - 1
+            decoder_position_ids.masked_fill_(decoder_attention_mask < 0, 0)
+            decoder_position_ids = decoder_position_ids[:, -1:]
+        else:
+            decoder_position_ids = None
+
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules.
+        # If we're using a cache, we only need the last value
+        # of decoder_input_ids.
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if past is not None:
+            decoder_input_ids = decoder_input_ids[:, -1:]
+
+        return {
+            "input_ids": None,  # encoder_outputs is defined. input_ids not needed
+            "encoder_outputs": encoder_outputs,
+            "past_key_values": past,
+            "decoder_input_ids": decoder_input_ids,
+            "decoder_attention_mask": decoder_attention_mask,
+            "decoder_position_ids": decoder_position_ids,
+            "attention_mask": attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "use_cache": use_cache,  # change this to avoid caching (presumably for debugging)
+        }
 
 
-def main():
+def main(model = None):
+    print("Starting main.")
+    print("importing")
+    import numpy as np
+    import transformers
+    import our_tokenizer
+    import our_data_collator
+    print("done w imports")
+
     maxlen = 1000
+    seq_len = 128
     depth = 10
     bsz = 3
-
+    padding_idx = 0
+        
     modified_layer = ModifiedBartLearnedPositionalEmbedding(maxlen, depth)
     original_layer = original.BartLearnedPositionalEmbedding(maxlen, depth)
     modified_layer.weight = original_layer.weight
-    fake_attention_mask = torch.ones(bsz, maxlen, dtype=torch.long)
+    fake_attention_mask = torch.ones((bsz, seq_len), dtype=torch.long)
+    input_ids = torch.ones((bsz, seq_len), dtype=torch.long)
 
-    for i in range(10):
-        start = i
-        new = modified_layer((bsz, maxlen - start), start, fake_attention_mask)
-        old = original_layer((bsz, maxlen - start), start)
-        assert torch.allclose(new, old)
-    print(modified_layer.weight)
-    print("test passed")
+    new = modified_layer(
+        input_ids_shape=input_ids.shape,
+        past_key_values_length=0,
+        attention_mask=fake_attention_mask,
+        input_ids=input_ids,
+        padding_idx=padding_idx,
+        position_ids=None,
+    )
+    old = original_layer(
+        input_ids_shape=input_ids.shape,
+        past_key_values_length=0,
+    )
+    assert torch.allclose(new, old)
+
+
+    tokenizer = our_tokenizer.Tokenizer(max_length=1024, use_equal_symbol=True)
+
+    config = transformers.BartConfig.from_pretrained("facebook/bart-base")
+    config.no_repeat_ngram_size = 0
+    config.pad_token_id = tokenizer.pad_token_id
+    config.decoder_start_token_id = tokenizer.bos_token_id
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    assert config.eos_token_id != config.pad_token_id, (
+        f"eos_token_id and pad_token_id should not be the same. eos_token_id:"
+        f" {config.eos_token_id}, pad_token_id: {config.pad_token_id}"
+    )
+    config.forced_bos_token_id = tokenizer.bos_token_id
+    config.forced_eos_token_id = tokenizer.eos_token_id
+    config.vocab_size = len(tokenizer.vocab)
+    config.task_specific_params = {}
+
+    ###############################################################
+    # Can change
+    ###############################################################
+    config.num_hidden_layers = 2 # Default is 6
+    config.hidden_size = 128 # Default is 768
+    config.encoder_attention_heads = 4 # Default is 16
+    config.decoder_attention_heads = 4 # Default is 16
+    config.encoder_ffn_dim = config.hidden_size * 4 # Default is 4096
+    config.decoder_ffn_dim = config.hidden_size * 4
+
+    config.dropout = 0
+    config.layerdrop = 0
+
+    assert tokenizer.max_length == config.max_position_embeddings, (
+        f"max_length={tokenizer.max_length} != "
+        f"config.max_position_embeddings={config.max_position_embeddings}"
+    )
+
+    if model is None:
+        model = ModifiedBartForConditionalGeneration(
+            config
+        ).cuda().eval()
+
+    collator = our_data_collator.DataCollatorWithDecoderInputIds(tokenizer, model, 512, -100)
+
+    ###############################################################
+    # Prep input a
+    ###############################################################
+    inputs_a = tokenizer("1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15")
+    labels_a = tokenizer("1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 = 4")
+    features_a = [
+        dict(
+            input_ids=inputs_a,
+            labels=labels_a,
+        )
+    ]
+    preped_a = collator(features_a)
+    for k, v in preped_a.items():
+        preped_a[k] = v.cuda()
+    output_a = model(**preped_a, use_cache=False)
+
+    ###############################################################
+    # Prep input b
+    ###############################################################
+    inputs_b = inputs_a
+    diff = 15
+    pos = 3
+    rtol = 0.01
+    labels_b = np.concatenate(
+        [
+            [0] * diff,
+            labels_a[:pos], 
+            [0] * diff, 
+            labels_a[pos:-pos], 
+            [0] * diff, 
+            labels_a[-pos:],
+        ]
+    )
+    # assert tokenizer.eos_token_id not in labels_b, labels_b
+    features_b = [
+        dict(
+            input_ids=inputs_b,
+            labels=labels_b,
+        )
+    ]
+
+    ###############################################################
+    # Collate and stuff
+    ###############################################################
+    preped_b = collator(features_b)
+    assert tokenizer.eos_token_id not in preped_b["decoder_input_ids"], preped_b["decoder_input_ids"]
+    assert tokenizer.eos_token_id not in preped_a["decoder_input_ids"], preped_a["decoder_input_ids"]
+    # preped_b["decoder_attention_mask"] = preped_b["decoder_input_ids"] != tokenizer.pad_token_id
+
+    for k, v in preped_b.items():
+        preped_b[k] = v.cuda()
+
+    ###############################################################
+    # Test forward
+    ###############################################################
+    output_b = model(**preped_b, use_cache=False)
+
+    first_set  = np.arange(15, 15 + 3)
+    second_set = np.arange(15 + 3, 15 + 3 + 32)
+    third_set  = np.arange(15 + 3 + 32, 15 + 3 + 32 + 3)
+
+    labels_first_set  = [labels_b[i           ] for i in first_set ]
+    labels_second_set = [labels_b[i + diff    ] for i in second_set]
+    labels_third_set  = [labels_b[i + diff * 2] for i in third_set ]
+
+    print(f"labels_a: { labels_a        }")
+    print(f"labels_b: { labels_b        }")
+    print(f"first:    {labels_first_set }")
+    print(f"second:   {labels_second_set}")
+    print(f"third:    {labels_third_set }")
+
+    assert np.all(np.array(labels_first_set ) != 0)
+    assert np.all(np.array(labels_second_set) != 0)
+    assert np.all(np.array(labels_third_set ) != 0)
+
+    first_range  = range(len(first_set ))
+    second_range = range(first_range.stop,  first_range.stop  + len(second_set))
+    third_range  = range(second_range.stop, second_range.stop + len(third_set))
+
+    print([torch.allclose(output_a.logits[0, i], output_b.logits[0, j           ], rtol=rtol) for i, j in zip(first_range,  first_set)])
+    print([torch.allclose(output_a.logits[0, i], output_b.logits[0, j +     diff], rtol=rtol) for i, j in zip(second_range, second_set)])
+    print([torch.allclose(output_a.logits[0, i], output_b.logits[0, j + 2 * diff], rtol=rtol) for i, j in zip(third_range,  third_set)])
+
+    ###############################################################
+    # Prepare for gen
+    ###############################################################
+    no_labels_a = {k: v for k, v in preped_a.items() if k != "labels"}
+    no_labels_b = {k: v for k, v in preped_b.items() if k != "labels"}
+
+    gen_options = dict(
+        num_beams=1, 
+        num_beam_groups=1, 
+        do_sample=False, 
+        use_cache=False,
+        min_length=0,  
+        max_length=len(labels_b) + 10, 
+        output_hidden_states=True, 
+        output_scores=True, 
+        return_dict_in_generate=True,
+    )
+    no_labels_a["decoder_input_ids"] = no_labels_a["decoder_input_ids"]
+
+    ###############################################################
+    # Test gen
+    ###############################################################
+    assert tokenizer.eos_token_id not in no_labels_a["decoder_input_ids"], preped_a["decoder_input_ids"]
+    assert tokenizer.eos_token_id not in no_labels_b["decoder_input_ids"], preped_b["decoder_input_ids"]
+
+    if "decoder_attention_mask" in "no_labels_a":
+        del no_labels_a["decoder_attention_mask"]
+
+    if "decoder_attention_mask" in "no_labels_b":
+        del no_labels_b["decoder_attention_mask"]
+
+    print(f"{no_labels_a['decoder_input_ids'] = }")
+    print(f"{no_labels_b['decoder_input_ids'] = }")
+    gen_a_dict = model.generate(**no_labels_a, **gen_options)
+    gen_b_dict = model.generate(**no_labels_b, **gen_options)
+    gen_options["use_cache"] = True
+    gen_c_dict = model.generate(**no_labels_b, **gen_options)
+    
+    print(f"{gen_a_dict['sequences'][0] = }")
+    print(f"{gen_b_dict['sequences'][0] = }")
+    print(f"{gen_c_dict['sequences'][0] = }")
+
+    str_a = tokenizer.decode(gen_a_dict["sequences"][0].detach().cpu().numpy().tolist(), False)
+    str_b = tokenizer.decode(gen_b_dict["sequences"][0].detach().cpu().numpy().tolist(), False)
+    str_c = tokenizer.decode(gen_b_dict["sequences"][0].detach().cpu().numpy().tolist(), False)
+
+    print(f"{str_a = }")
+    print(len(str_a.strip().split()))
+    print(f"{str_b = }")
+    print(len(str_b.strip().split()))
+    print(f"{str_c = }")
+    print(len(str_c.strip().split()))
+
+    min_length = min(
+        len(gen_a_dict["scores"]), 
+        len(gen_b_dict["scores"]), 
+        len(gen_c_dict["scores"]),
+    )
+    for i in range(min_length):
+        a = gen_a_dict["scores"][i]
+        b = gen_b_dict["scores"][i]
+        c = gen_c_dict["scores"][i]
+        print("a & b", torch.allclose(a, b, rtol=rtol))
+        print("b & c", torch.allclose(b, c, rtol=rtol))
+        print("a & c", torch.allclose(a, c, rtol=rtol))
+        print()
+
+
 
 if __name__ == "__main__":
     main()

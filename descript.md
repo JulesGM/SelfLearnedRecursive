@@ -1,19 +1,23 @@
 # Self Learned Explanations for Transformer Language Models
 Things to do:
-x - Fix the end of batch prepreparation
-x - Repair Oracle
-  - Freeform for the pred gens? ... investigate how to use decoder_attention_mask
+x  - Fix generation batching
    x ---> modify the bart class to correct the decoder embeddings
-     ---> ... find a way to cache the embedding positions or the 
-  - Fix the length of the generations for the fake labels
-     ---> max_gen = len(decoder_input_ids) + 
-  - Run experiments :)
+   x ---> corrected decoder padding
+   x ---> fixed caching
+   x --- ---> Check that the outputs are identical with and without caching
+
+x - Fix the length of the generations for the fake labels
+x ---> max_gen = len(decoder_input_ids) + 
+
+- Try oracle with just the parens
+- Run experiments :)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 How to make it faster:
- - Don't generate at each epoch?
+ - Only use parens. Would reduce generation length by a lot, & training speed as well even for oracle mode.
  - No beam search
  - Better work stack building
+ - Modify generation lengths
  - We tok encode and decode for kind of no reason
  - Use curriculum learning & self learning, For a certain node, do both children at once?
  -> Do different, independant positions in the tree simultaneously?

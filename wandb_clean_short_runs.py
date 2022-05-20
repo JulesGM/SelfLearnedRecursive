@@ -15,10 +15,13 @@ def main():
             minutes = (run.summary["_runtime"] // 60) % 60
             seconds = run.summary["_runtime"] % 60
             print(f"Runtime: {hours}h {minutes}m {seconds}s")
-            if run.state != "running" and minutes < 5 and hours == 0:
-                rich.print(f"[red bold]Candidate.")
+            if run.state != "running" and minutes < 30 and hours == 0:
+                run.delete()
+                rich.print("[red]deleting")
         else:
-            print("No runtime")
+            run.delete()
+            print("No runtime.")
+            rich.print("[red]deleting")
             print(run.summary)
         if "_step" in run.summary:
             print(run.summary["_step"])

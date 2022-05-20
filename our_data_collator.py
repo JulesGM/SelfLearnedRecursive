@@ -10,7 +10,6 @@ Table of Contents:
         - Create decoder input ids from labels if we have them.
         - Shift decoder input ids
 """
-from cProfile import label
 import dataclasses
 from typing import *
 
@@ -20,7 +19,7 @@ import transformers
 import transformers.models.bart.modeling_bart as modeling_bart
 
 
-def _pad_batch_of_sequences_from_dict(features, key, pad_token_id) -> None:
+def _pad_batch_of_sequences_from_dict(features, key, pad_token_id, pad_direction) -> None:
     """
     Pad a batch of sequences, with a certain key value.
 
@@ -34,10 +33,17 @@ def _pad_batch_of_sequences_from_dict(features, key, pad_token_id) -> None:
         remainder = [pad_token_id] * (max_length - len(key_entry))
 
         if isinstance(entry, list):
-            features[i][key] = key_entry + remainder
+            if pad_direction == "right":
+                features[i][key] = key_entry + remainder
+            elif pad_direction == "left":
+                features[i][key] = remainder + key_entry
+            else:
+                raise ValueError("pad_direction must be 'right' or 'left'")
         else:
-            features[i][key] = np.concatenate([key_entry, remainder]).astype(np.int64)
-
+            if pad_direction == "right":
+                features[i][key] = np.concatenate([key_entry, remainder]).astype(np.int64)
+            elif pad_direction == "left":
+                features[i][key] = np.concatenate([remainder, key_entry]).astype(np.int64)
 
 class DataCollatorWithDecoderInputIds:
     __slots__ = (
@@ -92,6 +98,7 @@ class DataCollatorWithDecoderInputIds:
 
         assert "input_ids" in keys
         assert not "decoder_input_ids" in keys
+        DECODER_PAD_DIRECTION = "left"
 
         #######################################################################
         # 1. Pad labels
@@ -101,6 +108,7 @@ class DataCollatorWithDecoderInputIds:
                 features,
                 "labels", 
                 self.label_pad_token_id,
+                pad_direction=DECODER_PAD_DIRECTION,
             )
 
         #######################################################################
@@ -111,12 +119,12 @@ class DataCollatorWithDecoderInputIds:
                 features, 
                 "decoder_input_ids_for_gen",
                 self.model.config.pad_token_id,
+                pad_direction=DECODER_PAD_DIRECTION,
                 )
 
         #######################################################################
         # 3. Pad inputs & convert everything to tensors
         #######################################################################
-        pre_tok_features = features
         features = self.tokenizer.pad(
             features,
             padding=True,
@@ -132,6 +140,10 @@ class DataCollatorWithDecoderInputIds:
             features["decoder_input_ids"] = self.model.prepare_decoder_input_ids_from_labels(
                 labels=features["labels"]
             )
+            # features["decoder_input_ids"].masked_fill_(
+            #     features["decoder_input_ids"] == self.tokenizer.eos_token_id, 
+            #     self.tokenizer.pad_token_id,
+            # )
         
         #######################################################################
         # 5. If we have gen decoder inputs, we shift them as well.
@@ -144,19 +156,14 @@ class DataCollatorWithDecoderInputIds:
                 self.model.config.bos_token_id,
             ) 
 
-            # Remove the mask
-            features["decoder_input_ids_for_gen"].masked_fill_(
-                features["decoder_input_ids_for_gen"] == self.tokenizer.eos_token_id, 
-                self.tokenizer.pad_token_id,
-            )
+            # features["decoder_input_ids_for_gen"].masked_fill_(
+            #     features["decoder_input_ids_for_gen"] == self.tokenizer.eos_token_id, 
+            #     self.tokenizer.pad_token_id,
+            # )
 
             assert torch.all(
                 features["decoder_input_ids_for_gen"][:, 0] == 
                 self.model.config.decoder_start_token_id
             ), features["decoder_input_ids_for_gen"][:, 0]
 
-            features["decoder_attention_mask_for_gen"] = (
-                features["decoder_input_ids_for_gen"] != self.tokenizer.pad_token_id
-            )
-            
         return features

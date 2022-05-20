@@ -56,31 +56,32 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
     has_curriculum = False
     
     def __init__(self, dataset: Dict[str, List[datagen.Node]], tokenizer):
-        self.dataset = dataset["first"] + dataset["second"] + dataset["third"]
-        random.shuffle(self.dataset)
+        self._dataset = dataset["first"] + dataset["second"] + dataset["third"]
+        random.shuffle(self._dataset)
         self.tokenizer = tokenizer
-        self.pred_functor = None
-        self.conc_mode = True
+        self._pred_functor = None
+        self._conc_mode = None
         
     def __len__(self):
-        return len(self.dataset)
+        return len(self._dataset)
 
     def get(self, idx):
-        start = time.perf_counter()
-        input_ = self.dataset[idx].get_input_str()
-        if self.conc_mode == "yield":
-            output = yield from self.dataset[idx].get_pseudo(
-                self.pred_functor, 
+        input_ = self._dataset[idx].get_input_str()
+        if self._conc_mode == "yield":
+            assert self._pred_functor is None, "Pred functor not used in yield mode"
+            output = yield from self._dataset[idx].get_pseudo(
+                None, 
                 head_type="oracle", 
-                conc_mode=self.conc_mode, 
-                logging_info=datagen.PredLogger(self.dataset[idx])
+                conc_mode=self._conc_mode, 
+                logging_info=datagen.PredLogger(self._dataset[idx])
             )
         else:
-            output = self.dataset[idx].get_pseudo(
-                self.pred_functor, 
+            assert self._pred_functor
+            output = self._dataset[idx].get_pseudo(
+                self._pred_functor, 
                 head_type="oracle", 
-                conc_mode=self.conc_mode, 
-                logging_info=datagen.PredLogger(self.dataset[idx])
+                conc_mode=self._conc_mode, 
+                logging_info=datagen.PredLogger(self._dataset[idx])
             )
 
         pseudo_str, pseudo_without_head = output
@@ -97,13 +98,22 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
         # rich.print(f"[green]Took {end - start} seconds to get item {idx}")
         return ouptut
 
-    def set_pred_functor(self, pred_functor, conc_mode):
-        self.pred_functor = pred_functor
-        self.conc_mode = conc_mode
+    def set_pred_functor(self, pred_functor):
+        self._pred_functor = pred_functor
+        if self._conc_mode == "yield":
+            assert self._pred_functor is None, (
+                "Pred functor not used in yield mode"
+            )
+
+    def set_conc_mode(self, conc_mode):
+        self._conc_mode = conc_mode
+        if self._conc_mode == "yield":
+            assert self._pred_functor is None, (
+                "Pred functor not used in yield mode"
+            )
 
     def set_send_pull(self, send_pull):
-        self.pred_functor.set_send_pull(send_pull)
-
+        self._pred_functor.set_send_pull(send_pull)
 
 
         

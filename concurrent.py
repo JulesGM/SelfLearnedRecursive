@@ -42,7 +42,7 @@ from tqdm import tqdm
 
 import datagen
 
-def actual_prediction(batch, collator, model, tokenizer, generation_kwargs):
+def actual_prediction(batch, collator, model, generation_kwargs, gen_function, max_answer_gen):
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Use the Data Collator on the data
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -57,26 +57,28 @@ def actual_prediction(batch, collator, model, tokenizer, generation_kwargs):
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Create the decoder_attention_mask
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    batch["decoder_attention_mask"] = batch["decoder_attention_mask_for_gen"]
-    del batch["decoder_attention_mask_for_gen"]
+    if "decoder_attention_mask" in batch:
+        batch["decoder_attention_mask"] = batch["decoder_attention_mask_for_gen"]
+        del batch["decoder_attention_mask_for_gen"]
 
     bound_length = min(model.config.max_length - 6, batch["decoder_input_ids_for_gen"].shape[1] - 1)
     batch["decoder_input_ids"] = batch["decoder_input_ids_for_gen"][:, :bound_length] # TODO: LENGTH STUFF
-    rich.print("[red bold]FIX DECODER LENGTH STUFF AND DECODER HEAD")
     del batch["decoder_input_ids_for_gen"]
 
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Generate
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     start = time.perf_counter()
-    output = model.cuda().generate(
+    output = gen_function(
+        model=model,
         **batch,
-        **generation_kwargs
+        **generation_kwargs,
+        max_length=max_answer_gen + batch["input_ids"].shape[1]
     )
 
     delta = time.perf_counter() - start
     
-    print(f"Generation took {delta:.5f} seconds, {delta / output.shape[0]}s per item.")
+    # print(f"Generation took {delta:.5f} seconds, {delta / output.shape[0]}s per item.")
     return output
 
 def make_thread_safe_pipes():

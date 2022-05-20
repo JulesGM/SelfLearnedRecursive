@@ -12,7 +12,6 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "--run_name",     "oracle no curriculum",
                 "--dataset_type", "oracle_basic_dataset", 
             ],
         },
@@ -24,7 +23,6 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "--run_name",     "self learned no curriculum",
                 "--dataset_type", "self_learned_basic_dataset", 
             ],
         },
@@ -36,7 +34,6 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "--run_name",     "most basic no curriculum",
                 "--dataset_type", "most_basic_dataset", 
             ],
         },
@@ -47,6 +44,14 @@
             "program": "${workspaceFolder}/datagen.py",
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Python: Modded Bart",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/modded_bart.py",
+            "console": "integratedTerminal",
+            "justMyCode": false
         }
     ]
 }

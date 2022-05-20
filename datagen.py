@@ -155,7 +155,7 @@ class Node:
             
         return self._oracle_str, self._oracle_without_top_val
 
-    def get_pseudo(self, prediction_function: Callable, head_type: str, conc_mode: str, logging_info: "PredLogger"):
+    def get_pseudo(self, prediction_function: Optional[Callable], head_type: str, conc_mode: str, logging_info: "PredLogger"):
         """ 
 
         head_types are eaither "pred" or "oracle".
@@ -166,11 +166,17 @@ class Node:
 
         """
         # Multiple calls will have DIFFERENT RESULTS
+        if conc_mode == "yield":
+            assert prediction_function is None, (
+                "Cannot use prediction function with yield mode"
+            )
+
 
         assert head_type in ["pred", "oracle"]
 
         if self.get_children() is not None:
             if conc_mode == "pool":
+                assert False
                 with futures.ThreadPoolExecutor(max_workers=2) as pool:
                     a_prom = pool.submit(
                         self.get_children()[0].get_pseudo, 
@@ -191,18 +197,19 @@ class Node:
                     b_str, _ = b_prom.result()
             elif conc_mode == "yield":
                 a_str, _ = yield from self.get_children()[0].get_pseudo(
-                    prediction_function, 
+                    None, 
                     head_type="pred", 
                     conc_mode=conc_mode, 
                     logging_info=logging_info
                 )
                 b_str, _ = yield from self.get_children()[1].get_pseudo(
-                    prediction_function, 
+                    None, 
                     head_type="pred", 
                     conc_mode=conc_mode, 
                     logging_info=logging_info
                 )
             elif conc_mode is None:
+                assert False
                 a_str, _ = self.get_children()[0].get_pseudo(
                     prediction_function, 
                     head_type="pred", 
@@ -223,7 +230,6 @@ class Node:
                 if head_type == "oracle":
                     head = self.get_value()
                 elif head_type == "pred":
-                    
                     if conc_mode == "yield":
                         head = yield dict(
                             input_str=self.get_input_str(), 
