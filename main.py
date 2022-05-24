@@ -1,5 +1,6 @@
 print("Importing modules")
 import dataclasses
+import graphlib
 import itertools
 import logging
 import math
@@ -31,7 +32,7 @@ import our_datasets
 import our_metrics
 import our_tokenizer
 import modded_bart
-import concurrent
+import concurrent_parts
 print("Done loading modules")
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -49,7 +50,7 @@ RUN_NAME_DEFAULT  = "ORACLE NO CACHE"
 ACTIVE_MODES      = {ValidModes.per_batch}
 FREEFORM_OPTIONS  = {False}
 NUM_BATCHES_VALID = 30
-
+BATCH_SIZE = 1024
 MAX_ANSWER_GEN = 5
 MAX_TOTAL_GEN_LENGTH = 88
 
@@ -73,11 +74,10 @@ def generate(model: modded_bart.ModifiedBartForConditionalGeneration, **kwargs):
 GEN_FUNCTION = generate
 
 #########################################################################################################
-PIPE_TYPE = concurrent.make_thread_safe_pipes
+PIPE_TYPE = concurrent_parts.make_thread_safe_pipes
 POOL_CONSTRUCTOR = lambda num_workers: dummy.Pool(processes=num_workers)
 CONC_MODE = "yield"
 LOOP_WAIT_SEC = 0
-BATCH_SIZE = 1024
 MULTIPROCESSING_METHOD = None
 #########################################################################################################
 
@@ -144,10 +144,14 @@ def color_matching(seq_a, seq_b):
 
 
 class RenewableGenerator:
-    def __init__(self, fn):
+    def __init__(self, fn, len):
         self.fn = fn
         self.iter = None
-    
+        self.len = len
+
+    def __len__(self):
+        return self.len
+
     def __iter__(self):
         self.iter = self.fn()
         return self
@@ -155,6 +159,13 @@ class RenewableGenerator:
     def __next__(self):
         return next(self.iter)
 
+def top_sort_build_tree(dep_dict: dict, visited_datagen: datagen.Node):
+    if visited_datagen.get_children():
+        dep_dict[visited_datagen] = []
+        for child in visited_datagen.get_children():
+            if child.get_children():
+                dep_dict[visited_datagen].append(child)
+                top_sort_build_tree(dep_dict, child)
 
 class PLBart(pl.LightningModule):
     def __init__(self, *, 
@@ -177,6 +188,7 @@ class PLBart(pl.LightningModule):
             max_generation_quantity_valid: int,
         ):
         super().__init__()
+        self.mask_intermediate_labels = isinstance(train_ds, our_datasets.SelfLearnedBasicDataset)
         self.shuffle_train =            False
         self.shuffle_val =              False
         self.tokenizer =                tokenizer
@@ -221,6 +233,9 @@ class PLBart(pl.LightningModule):
         self.curriculum_mode =          curriculum_mode
         self.cluster_picker =           curriculum_instance
         self.already_started =          False
+        
+
+        assert "max_length" not in self.generation_kwargs, "the max length is computed dynamically"
 
     def forward(self, *args, **kwargs):
         if "decoder_input_ids_for_gen" in kwargs:
@@ -249,14 +264,15 @@ class PLBart(pl.LightningModule):
                 for is_freeform in FREEFORM_OPTIONS:
                     generation_kwargs = dict(**self.generation_kwargs)
                     if not is_freeform:
-                        generation_kwargs["decoder_input_ids"] = batch["decoder_input_ids_for_gen"]
-                        # generation_kwargs["decoder_attention_mask"] = batch["decoder_input_ids_for_gen"] != self.tokenizer.pad_token_id
+                        generation_kwargs["decoder_input_ids"] = batch["decoder_input_ids_for_gen"][:, :MAX_TOTAL_GEN_LENGTH]
                         
                     per_batch_preds[is_freeform] = GEN_FUNCTION(
                         self.model,
                         input_ids=              batch["input_ids"], 
                         attention_mask=         batch["attention_mask"],
-                        max_length = MAX_TOTAL_GEN_LENGTH if is_freeform else generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN,
+                        max_length = MAX_TOTAL_GEN_LENGTH if is_freeform else min(
+                            generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN, MAX_TOTAL_GEN_LENGTH
+                        ),
                         **generation_kwargs, 
                     )
     
@@ -306,10 +322,9 @@ class PLBart(pl.LightningModule):
                                 x for x in sample["decoder_input_ids_for_gen"] 
                                 if x != self.tokenizer.pad_token_id
                             ]
-                            generation_kwargs["decoder_input_ids"] = (
-                                torch.stack(took_out_pad_tokens).reshape(
-                                    1, -1)[:, :generation_kwargs["max_length"] - 1]
-                            )
+                            generation_kwargs["decoder_input_ids"] = torch.stack(
+                                took_out_pad_tokens).reshape(1, -1)[:, :MAX_TOTAL_GEN_LENGTH]
+
                         
                         assert sample["input_ids"] is not None
                         assert sample["attention_mask"] is not None
@@ -321,7 +336,7 @@ class PLBart(pl.LightningModule):
                             **generation_kwargs, 
                             max_length=(
                                 MAX_TOTAL_GEN_LENGTH if is_freeform else 
-                                generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN
+                                min(generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN, MAX_TOTAL_GEN_LENGTH)
                             )
                         )
                         
@@ -357,12 +372,16 @@ class PLBart(pl.LightningModule):
                             
                             if "decoder_input_ids" in generation_kwargs:
                                 if mode == ValidModes.per_sample:
-                                    assert len(generation_kwargs["decoder_input_ids"].shape) == 2, generation_kwargs['decoder_input_ids'].shape     
-                                    assert generation_kwargs["decoder_input_ids"].shape[0] == 1, generation_kwargs['decoder_input_ids'].shape
-                                    cleaned_decoder_input_ids = clean_sample_for_logging(generation_kwargs["decoder_input_ids"][0], self.tokenizer)
+                                    assert len(generation_kwargs["decoder_input_ids"].shape) == 2, (
+                                        generation_kwargs['decoder_input_ids'].shape)
+                                    assert generation_kwargs["decoder_input_ids"].shape[0] == 1, (
+                                        generation_kwargs['decoder_input_ids'].shape)
+                                    cleaned_decoder_input_ids = clean_sample_for_logging(
+                                        generation_kwargs["decoder_input_ids"][0], self.tokenizer)
                                     ids = generation_kwargs["decoder_input_ids"][0]
                                 elif ValidModes.per_batch:
-                                    cleaned_decoder_input_ids = clean_sample_for_logging(sample["decoder_input_ids_for_gen"], self.tokenizer)
+                                    cleaned_decoder_input_ids = clean_sample_for_logging(
+                                        sample["decoder_input_ids_for_gen"], self.tokenizer)
                                     ids = sample["decoder_input_ids_for_gen"]
                                 else:
                                     raise ValueError(f"Unknown mode {mode}")
@@ -452,6 +471,8 @@ class PLBart(pl.LightningModule):
         collator = our_data_collator.DataCollatorWithDecoderInputIds(
             self.tokenizer, 
             model=self.model, 
+            max_length=self.tokenizer.max_length,
+            mask_intermediate_labels=self.mask_intermediate_labels,
         )
 
         if shuffle:
@@ -459,22 +480,8 @@ class PLBart(pl.LightningModule):
         else:
             indices = np.arange(len(ds))
 
-        if CONC_MODE != "yield":
-            assert False, "Not supported anymore"
-            yield from concurrent.start(
-                indices, 
-                batch_size, 
-                PIPE_TYPE, 
-                dl_name, 
-                ds, 
-                collator, 
-                self.model, 
-                self.tokenizer, 
-                self.generation_kwargs, 
-                LOOP_WAIT_SEC, 
-                POOL_CONSTRUCTOR,
-            )
-        else:
+        
+        if CONC_MODE == "yield":
             for i in tqdm(range(0, len(ds), batch_size), desc=f"progress in {dl_name}"):
                 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # 
@@ -543,14 +550,14 @@ class PLBart(pl.LightningModule):
                         # Do the prediction
                         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # rich.print(f"[redbold]{len(without_logging_info) = } / {batch_size}")
-                        outputs = concurrent.actual_prediction(
+                        outputs = concurrent_parts.actual_prediction(
                             batch=without_logging_info,
                             collator=collator, 
                             model=self.model, 
-                            tokenizer=self.tokenizer, 
                             generation_kwargs=self.generation_kwargs,
                             gen_function=GEN_FUNCTION,
                             max_answer_gen=MAX_ANSWER_GEN,
+                            max_total_gen_length=MAX_TOTAL_GEN_LENGTH,
                             )
                         
 
@@ -576,6 +583,59 @@ class PLBart(pl.LightningModule):
                 
                 yield collator(final_values)
 
+        if CONC_MODE == "top_sort":
+            assert False
+            for i in tqdm(range(0, len(ds), batch_size), desc=f"progress in {dl_name}"):
+                batch_indices = indices[i:i + batch_size]
+                root_nodes = [ds.get(i) for i in batch_indices]
+                sorters = [] # 1 to 1 with root nodes, ok
+
+                for root_node in root_nodes:
+                    tree = {}
+                    top_sort_build_tree(tree, root_node)
+                    sorter = graphlib.TopologicalSorter(tree)
+                    sorter.prepare()
+                    sorters.append(sorter)
+                
+                at_least_one = True
+                while at_least_one:
+                    at_least_one = False
+                    node_batch: List[datagen.Node] = []
+                    nodes_to_sorters = {}
+                    for sorter in sorters:
+                        if sorter.is_active():
+                            nodes = sorter.get_ready()
+                            for node in nodes:
+                                nodes_to_sorters[node] = sorter
+                            node_batch.extend()
+
+                    input_ids = [self.tokenizer(node.get_input_str()) for node in node_batch]
+                    decoder_input_ids = [self.tokenizer(node.get_pseudo_topsort_query()) for node in node_batch]
+                    batch = dict(input_ids=input_ids, decoder_input_ids=decoder_input_ids, labels=labels)
+                    outputs = concurrent_parts.actual_prediction(
+                            batch=all_queries,
+                            collator=collator, 
+                            model=self.model, 
+                            generation_kwargs=self.generation_kwargs,
+                            gen_function=GEN_FUNCTION,
+                            max_answer_gen=MAX_ANSWER_GEN,
+                            max_total_gen_length=MAX_TOTAL_GEN_LENGTH,
+                        )
+
+                    for node, output in zip(sorters, node_batch, outputs):
+                        text = self.tokenizer.decode(output.detach().cpu().numpy().tolist())
+                        node.set_pseudo_value(text.split("=")[-1])
+                        node_to_sorter[node].done(node)
+                
+                    for sorter in sorters:
+                        if sorter.is_active():
+                            at_least_one = True
+                            break
+
+                # TODO: Build final values.
+                # TODO: This means, do the -100 stuff.
+                yield 
+
     @beartype
     def _make_regular_dataloader(
         self, 
@@ -592,6 +652,8 @@ class PLBart(pl.LightningModule):
                 collate_fn=our_data_collator.DataCollatorWithDecoderInputIds(
                     self.tokenizer, 
                     model=self.model, 
+                    max_length=self.tokenizer.max_length,
+                    mask_intermediate_labels=self.mask_intermediate_labels,
                 ), 
                 batch_size=batch_size, 
                 num_workers=self.num_workers_dl,
@@ -606,7 +668,8 @@ class PLBart(pl.LightningModule):
                     self.batch_size,
                     shuffle=self.shuffle_train,
                     dl_name="train_dl"
-                )
+                ),
+                len=math.ceil(len(self.train_ds) / self.batch_size),
             )
         else:
             return self._make_regular_dataloader(
@@ -623,7 +686,8 @@ class PLBart(pl.LightningModule):
                     self.batch_size,
                     shuffle=self.shuffle_val,
                     dl_name="val_dl"
-                )
+                ),
+                len=math.ceil(len(self.eval_ds) / self.batch_size),
             )
         else:
             return self._make_regular_dataloader(
@@ -711,9 +775,11 @@ def main(
     ):
         train_torch_dataset.set_conc_mode(CONC_MODE)
         valid_torch_dataset.set_conc_mode(CONC_MODE)
+        train_torch_dataset.set_mask_intermediate_labels(True)
+        valid_torch_dataset.set_mask_intermediate_labels(True)
 
         if CONC_MODE == "pool":
-            functor = concurrent.SendPullPredFunctor(tokenizer)
+            functor = concurrent_parts.SendPullPredFunctor(tokenizer)
             train_torch_dataset.set_pred_functor(functor)
             valid_torch_dataset.set_pred_functor(functor)
         
