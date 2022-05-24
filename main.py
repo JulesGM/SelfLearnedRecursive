@@ -32,7 +32,7 @@ import our_datasets
 import our_metrics
 import our_tokenizer
 import modded_bart
-import concurrent_parts
+import concurrent_execution
 print("Done loading modules")
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -74,7 +74,7 @@ def generate(model: modded_bart.ModifiedBartForConditionalGeneration, **kwargs):
 GEN_FUNCTION = generate
 
 #########################################################################################################
-PIPE_TYPE = concurrent_parts.make_thread_safe_pipes
+PIPE_TYPE = concurrent_execution.make_thread_safe_pipes
 POOL_CONSTRUCTOR = lambda num_workers: dummy.Pool(processes=num_workers)
 CONC_MODE = "yield"
 LOOP_WAIT_SEC = 0
@@ -550,7 +550,7 @@ class PLBart(pl.LightningModule):
                         # Do the prediction
                         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # rich.print(f"[redbold]{len(without_logging_info) = } / {batch_size}")
-                        outputs = concurrent_parts.actual_prediction(
+                        outputs = concurrent_execution.actual_prediction(
                             batch=without_logging_info,
                             collator=collator, 
                             model=self.model, 
@@ -612,7 +612,7 @@ class PLBart(pl.LightningModule):
                     input_ids = [self.tokenizer(node.get_input_str()) for node in node_batch]
                     decoder_input_ids = [self.tokenizer(node.get_pseudo_topsort_query()) for node in node_batch]
                     batch = dict(input_ids=input_ids, decoder_input_ids=decoder_input_ids, labels=labels)
-                    outputs = concurrent_parts.actual_prediction(
+                    outputs = concurrent_execution.actual_prediction(
                             batch=all_queries,
                             collator=collator, 
                             model=self.model, 
@@ -779,7 +779,7 @@ def main(
         valid_torch_dataset.set_mask_intermediate_labels(True)
 
         if CONC_MODE == "pool":
-            functor = concurrent_parts.SendPullPredFunctor(tokenizer)
+            functor = concurrent_execution.SendPullPredFunctor(tokenizer)
             train_torch_dataset.set_pred_functor(functor)
             valid_torch_dataset.set_pred_functor(functor)
         
