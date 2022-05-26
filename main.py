@@ -30,11 +30,7 @@ import our_datasets
 import our_metrics
 import our_tokenizer
 import modded_bart
-<<<<<<< HEAD
 import concurrent_parts
-=======
-import concurrent_execution
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
 print("Done loading modules")
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -50,7 +46,6 @@ class ValidModes:
 #########################################################################################################
 RUN_NAME_DEFAULT  = "experimentation"
 ACTIVE_MODES      = {ValidModes.per_batch}
-<<<<<<< HEAD
 FREEFORM_OPTIONS  = {True}
 NUM_BATCHES_VALID = 5
 EVAL_EVERY_N_EPOCHS = 2
@@ -62,11 +57,6 @@ H_SIZE = 64
 BATCH_SIZE = 1024
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0
-=======
-FREEFORM_OPTIONS  = {False}
-NUM_BATCHES_VALID = 30
-BATCH_SIZE = 1024
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
 MAX_ANSWER_GEN = 5
 MAX_TOTAL_GEN_LENGTH = 88
 GRADIENT_CLIP_VAL = 0.1
@@ -92,15 +82,7 @@ GEN_FUNCTION = generate
 
 
 #########################################################################################################
-<<<<<<< HEAD
 CONC_MODE = "yield"
-=======
-PIPE_TYPE = concurrent_execution.make_thread_safe_pipes
-POOL_CONSTRUCTOR = lambda num_workers: dummy.Pool(processes=num_workers)
-CONC_MODE = "yield"
-LOOP_WAIT_SEC = 0
-MULTIPROCESSING_METHOD = None
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
 #########################################################################################################
 
 
@@ -267,7 +249,6 @@ class PLBart(pl.LightningModule):
 
         # Curriculum
         self.curriculum_mode =          curriculum_mode
-<<<<<<< HEAD
         assert "max_length" not in self.generation_kwargs, "the max length is computed dynamically"
 
     def on_train_epoch_start(self):
@@ -280,13 +261,6 @@ class PLBart(pl.LightningModule):
                     2: 1.,
                 }
             )
-=======
-        self.cluster_picker =           curriculum_instance
-        self.already_started =          False
-        
-
-        assert "max_length" not in self.generation_kwargs, "the max length is computed dynamically"
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
 
     def on_validation_start(self) -> None:
         if isinstance(self.eval_ds, our_datasets.CurriculumSelfLearned):
@@ -320,36 +294,6 @@ class PLBart(pl.LightningModule):
         things_to_log = dict(eval_loss=loss)
         per_batch_preds = None
         self.model = self.model.eval()
-<<<<<<< HEAD
-=======
-        if batch_idx % 100 == 0:
-            if ValidModes.per_batch in ACTIVE_MODES:
-                per_batch_preds = {}
-                for is_freeform in FREEFORM_OPTIONS:
-                    generation_kwargs = dict(**self.generation_kwargs)
-                    if not is_freeform:
-                        generation_kwargs["decoder_input_ids"] = batch["decoder_input_ids_for_gen"][:, :MAX_TOTAL_GEN_LENGTH]
-                        
-                    per_batch_preds[is_freeform] = GEN_FUNCTION(
-                        self.model,
-                        input_ids=              batch["input_ids"], 
-                        attention_mask=         batch["attention_mask"],
-                        max_length = MAX_TOTAL_GEN_LENGTH if is_freeform else min(
-                            generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN, MAX_TOTAL_GEN_LENGTH
-                        ),
-                        **generation_kwargs, 
-                    )
-    
-            em = {
-                mode: {
-                    k: our_metrics.EM() for k in FREEFORM_OPTIONS if not (mode == ValidModes.per_sample and k)
-                } for mode in ACTIVE_MODES
-            }
-            for i, pack in enumerate(tqdm(
-                zip_dicts(batch), desc="Validating", total=len(batch["input_ids"])
-            )):
-                do_print = batch_idx == 0 and i < 5
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
 
         #######################################################################
         # Print every N batches
@@ -441,7 +385,6 @@ class PLBart(pl.LightningModule):
                     # Prep decoder input ids
                     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-<<<<<<< HEAD
                     if self.eval_ds.has_decoder_input_ids_for_gen and not is_freeform:
                         took_out_pad_tokens = [
                             x for x in sample["decoder_input_ids_for_gen"] 
@@ -459,35 +402,6 @@ class PLBart(pl.LightningModule):
                         max_length = min(
                             generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN, 
                             MAX_TOTAL_GEN_LENGTH
-=======
-                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                        # Prep decoder input ids
-                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                        have_input_ids_to_provide = "decoder_input_ids_for_gen" in pack
-                        have_to_provide_decoder_input_ids = not is_freeform
-                        assert (not have_to_provide_decoder_input_ids or have_input_ids_to_provide)
-                        if have_input_ids_to_provide and have_to_provide_decoder_input_ids:
-                            took_out_pad_tokens = [
-                                x for x in sample["decoder_input_ids_for_gen"] 
-                                if x != self.tokenizer.pad_token_id
-                            ]
-                            generation_kwargs["decoder_input_ids"] = torch.stack(
-                                took_out_pad_tokens).reshape(1, -1)[:, :MAX_TOTAL_GEN_LENGTH]
-
-                        
-                        assert sample["input_ids"] is not None
-                        assert sample["attention_mask"] is not None
-
-                        per_sample_pred = GEN_FUNCTION(
-                            self.model,
-                            input_ids=sample["input_ids"].reshape(1, -1), 
-                            attention_mask=sample["attention_mask"].reshape(1, -1), 
-                            **generation_kwargs, 
-                            max_length=(
-                                MAX_TOTAL_GEN_LENGTH if is_freeform else 
-                                min(generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN, MAX_TOTAL_GEN_LENGTH)
-                            )
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
                         )
                     
 
@@ -539,7 +453,6 @@ class PLBart(pl.LightningModule):
                         cleaned_gen    = clean_sample_for_logging(pred               , self.tokenizer)
                         cleaned_decoder_input_ids = None
                         
-<<<<<<< HEAD
                         if "decoder_input_ids" in generation_kwargs:
                             if mode == ValidModes.per_sample:
                                 assert len(generation_kwargs["decoder_input_ids"].shape) == 2, (
@@ -555,55 +468,6 @@ class PLBart(pl.LightningModule):
                                 ids = sample["decoder_input_ids_for_gen"]
                             else:
                                 raise ValueError(f"Unknown mode {mode}")
-=======
-                        if do_print:
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            # Prep per-sample outputs
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            cleaned_inputs = clean_sample_for_logging(sample['input_ids'], self.tokenizer)
-                            cleaned_labels = clean_sample_for_logging(sample['labels']   , self.tokenizer)
-                            cleaned_gen    = clean_sample_for_logging(pred               , self.tokenizer)
-                            cleaned_decoder_input_ids = None
-                            
-                            if "decoder_input_ids" in generation_kwargs:
-                                if mode == ValidModes.per_sample:
-                                    assert len(generation_kwargs["decoder_input_ids"].shape) == 2, (
-                                        generation_kwargs['decoder_input_ids'].shape)
-                                    assert generation_kwargs["decoder_input_ids"].shape[0] == 1, (
-                                        generation_kwargs['decoder_input_ids'].shape)
-                                    cleaned_decoder_input_ids = clean_sample_for_logging(
-                                        generation_kwargs["decoder_input_ids"][0], self.tokenizer)
-                                    ids = generation_kwargs["decoder_input_ids"][0]
-                                elif ValidModes.per_batch:
-                                    cleaned_decoder_input_ids = clean_sample_for_logging(
-                                        sample["decoder_input_ids_for_gen"], self.tokenizer)
-                                    ids = sample["decoder_input_ids_for_gen"]
-                                else:
-                                    raise ValueError(f"Unknown mode {mode}")
-
-                                pos_embs = ((ids != self.tokenizer.pad_token_id).cumsum(-1) - 1).detach().cpu()
-                                del ids
-                                pos_embs.masked_fill_(pos_embs < 0, 0)
-                                pos_embs = pos_embs.numpy().tolist()
-
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            # Print them
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            rich.print(f"[black bold]{mode} {'Freeform' if is_freeform else 'Not-Freeform'}:")
-                            rich.print(f"Inputs:[blue]         \"{cleaned_inputs}\"")
-
-                            if cleaned_decoder_input_ids:
-                                rich.print(f"Decoder Inputs:[blue] \"{cleaned_decoder_input_ids}\"")
-                                # rich.print(f"Decoder ~posem:[blue] \"{' '.join(str(x) for x in pos_embs)}\"")
-
-                            rich.print(f"Gen:[blue]            \"{cleaned_gen}\"")
-                            rich.print(f"Label:[blue]          \"{cleaned_labels}")
-
-                            idx_colored_a, idx_colored_b = color_matching(clean_pred, clean_label)
-                            rich.print(f"(EM) Answer:    " + ", ".join(idx_colored_a))
-                            rich.print(f"(EM) Label:     " + ", ".join(idx_colored_b))
-                            print("~" * 80)
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
 
                         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # Print them
@@ -765,11 +629,7 @@ class PLBart(pl.LightningModule):
                         # Do the prediction
                         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # rich.print(f"[redbold]{len(without_logging_info) = } / {batch_size}")
-<<<<<<< HEAD
                         outputs = concurrent_parts.actual_prediction(
-=======
-                        outputs = concurrent_execution.actual_prediction(
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
                             batch=without_logging_info,
                             collator=collator, 
                             model=self.model, 
@@ -831,11 +691,7 @@ class PLBart(pl.LightningModule):
                     input_ids = [self.tokenizer(node.get_input_str()) for node in node_batch]
                     decoder_input_ids = [self.tokenizer(node.get_pseudo_topsort_query()) for node in node_batch]
                     batch = dict(input_ids=input_ids, decoder_input_ids=decoder_input_ids, labels=labels)
-<<<<<<< HEAD
                     outputs = concurrent_parts.actual_prediction(
-=======
-                    outputs = concurrent_execution.actual_prediction(
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
                             batch=all_queries,
                             collator=collator, 
                             model=self.model, 
@@ -897,11 +753,7 @@ class PLBart(pl.LightningModule):
                     shuffle=self.shuffle_train,
                     dl_name="train_dl"
                 ),
-<<<<<<< HEAD
                 len=num_batches,
-=======
-                len=math.ceil(len(self.train_ds) / self.batch_size),
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
             )
         else:
             return self._make_regular_dataloader(
@@ -924,11 +776,7 @@ class PLBart(pl.LightningModule):
                     shuffle=self.shuffle_val,
                     dl_name="val_dl"
                 ),
-<<<<<<< HEAD
                 len=num_batches,
-=======
-                len=math.ceil(len(self.eval_ds) / self.batch_size),
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
             )
         else:
             return self._make_regular_dataloader(
@@ -1016,14 +864,7 @@ def main(
         train_torch_dataset.set_mask_intermediate_labels(True)
         valid_torch_dataset.set_mask_intermediate_labels(True)
 
-<<<<<<< HEAD
         assert CONC_MODE == "yield"
-=======
-        if CONC_MODE == "pool":
-            functor = concurrent_execution.SendPullPredFunctor(tokenizer)
-            train_torch_dataset.set_pred_functor(functor)
-            valid_torch_dataset.set_pred_functor(functor)
->>>>>>> bfe57327ce9c32ac4356107c24332fd79eb1d89f
         
 
     pl_object = PLBart(
