@@ -1,3 +1,4 @@
+from typing import *
 
 import numpy as np
 import torch
@@ -17,26 +18,26 @@ class Tokenizer:
         "max_length",
     )
 
-    def __init__(self, max_length, use_equal_symbol):
+    def __init__(self, max_length: int, use_equal_symbol: bool):
         self.vocab = [
-            "<pad>", 
-            "<bos>", 
-            "<eos>", 
-            "0", 
-            "1", 
-            "2", 
-            "3", 
-            "4", 
-            "5", 
-            "6", 
-            "7", 
-            "8", 
-            "9", 
-            "+", 
-            "-", 
-            "*", 
-            "(", 
-            ")",
+            "<pad>",  # 0
+            "<bos>",  # 1
+            "<eos>",  # 2
+            "0",      # 3
+            "1",      # 4
+            "2",      # 5
+            "3",      # 6
+            "4",      # 7
+            "5",      # 8
+            "6",      # 9
+            "7",      # 10
+            "8",      # 11 
+            "9",      # 12
+            "+",      # 13
+            "-",      # 14
+            "*",      # 15
+            "(",      # 16
+            ")",      # 17
         ]
 
         if use_equal_symbol:
@@ -50,10 +51,10 @@ class Tokenizer:
         self.bos_token_id = self.token_to_idx["<bos>"]
         self.eos_token_id = self.token_to_idx["<eos>"]
         self.pad_token_id = self.token_to_idx["<pad>"]
-        self.padding_side = "right"
+        self.padding_side = "left"
         self.max_length = max_length
 
-    def encode(self, input_str, return_tensors="np"):
+    def encode(self, input_str: str, return_tensors: str = "np", no_eos: bool = False) -> Sequence:
         assert type(input_str) == str, type(input_str)
         output = []
         for char in input_str:
@@ -64,8 +65,11 @@ class Tokenizer:
                     continue
                 else:
                     raise ValueError(f"Unknown token '{char}'")
-        list_form = output + [self.token_to_idx["<eos>"]]
-
+        if no_eos:
+            list_form = output
+        else:
+            list_form = output + [self.token_to_idx["<eos>"]]
+            
         if return_tensors is None:
             output = list_form
         elif return_tensors == "np":
@@ -74,23 +78,26 @@ class Tokenizer:
             output = torch.tensor(list_form, dtype=torch.int64)
         else:
             raise ValueError(f"Unknown return_tensors value '{return_tensors}'")
+            
         return output
     
-    def decode(self, input_tokens, ignore_special_symbols):
+    def decode(self, input_tokens: List[int], ignore_special_symbols: bool) -> str:
         assert type(input_tokens) == list, type(input_tokens)
         output = []
         ignore_set = set([self.bos_token_id, self.eos_token_id, self.pad_token_id])
         for token_index in input_tokens:
             if ignore_special_symbols and token_index in ignore_set:
                 continue
-            if isinstance(token_index, int) and token_index >= 0 and token_index < len(self.idx_to_token):
+            if token_index == -100:
+                output.append("<-100>")
+            elif isinstance(token_index, int) and token_index >= 0 and token_index < len(self.idx_to_token):
                 output.append(self.idx_to_token[token_index])
             else:
                 raise ValueError(f"Unknown token index '{token_index}'")
         
         return " ".join(output)
 
-    def pad(self, features, padding, max_length, pad_to_multiple_of, return_tensors="np"):
+    def pad(self, features, padding, max_length: int, pad_to_multiple_of: bool, return_tensors: str = "np") -> Sequence:
         """ Pad input_token_ids, create attention_mask, convert everything to tensors.
         Mirrors huggingface tokenizers that way.
         """

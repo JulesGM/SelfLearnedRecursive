@@ -1,13 +1,12 @@
 print("Importing modules")
 import dataclasses
+import graphlib
 import itertools
 import logging
 import math
-import multiprocessing.dummy as dummy
-import multiprocessing
-
 from pathlib import Path
 import random
+import re
 import time
 
 from beartype import beartype
@@ -31,7 +30,7 @@ import our_datasets
 import our_metrics
 import our_tokenizer
 import modded_bart
-import concurrent
+import concurrent_parts
 print("Done loading modules")
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -41,20 +40,29 @@ LOGGER = logging.getLogger(__name__)
 class ValidModes:
     per_batch = "per_batch"
     per_sample = "per_sample"
-    
     valid_modes = {per_batch, per_sample}
 
-#########################################################################################################
-RUN_NAME_DEFAULT  = "ORACLE NO CACHE"
-ACTIVE_MODES      = {ValidModes.per_batch}
-FREEFORM_OPTIONS  = {False}
-NUM_BATCHES_VALID = 30
 
+#########################################################################################################
+RUN_NAME_DEFAULT  = "experimentation"
+ACTIVE_MODES      = {ValidModes.per_batch}
+FREEFORM_OPTIONS  = {True}
+NUM_BATCHES_VALID = 5
+EVAL_EVERY_N_EPOCHS = 2
+
+N_LAYERS = 2
+N_HEADS = 4
+H_SIZE = 64
+
+BATCH_SIZE = 1024
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 0
 MAX_ANSWER_GEN = 5
 MAX_TOTAL_GEN_LENGTH = 88
+GRADIENT_CLIP_VAL = 0.1
 
 GENERATION_KWARGS = dict(
-    num_beams=1,
+    num_beams=4,
     use_cache=True,
 
     # Should never hange:
@@ -72,13 +80,9 @@ def generate(model: modded_bart.ModifiedBartForConditionalGeneration, **kwargs):
     return model.generate(**kwargs)
 GEN_FUNCTION = generate
 
+
 #########################################################################################################
-PIPE_TYPE = concurrent.make_thread_safe_pipes
-POOL_CONSTRUCTOR = lambda num_workers: dummy.Pool(processes=num_workers)
 CONC_MODE = "yield"
-LOOP_WAIT_SEC = 0
-BATCH_SIZE = 1024
-MULTIPROCESSING_METHOD = None
 #########################################################################################################
 
 
@@ -87,12 +91,29 @@ def clean_sample_for_logging(tokens, tokenizer):
     Only removes -100 tokens values.
     """
     tokens_list = tokens.cpu().numpy().tolist()
-    tokens_list = [x for x in tokens_list if x != -100]
 
     as_string = tokenizer.decode(tokens_list, ignore_special_symbols=False)
 
-    return as_string.replace("<pad>", "[bright_cyan]^[/bright_cyan]")
+    
+    pale_map = {
+        "<-100>": "[bright_cyan]#[/bright_cyan]",
+        "<pad>": "[bright_cyan]^[/bright_cyan]",
+    }
 
+    for token, new_v in pale_map.items():
+        as_string = re.sub(
+            r"(?<=" + re.escape(token) + r")" + 
+            r"\s+"  + 
+            r"(?="  + re.escape(token) + r")", 
+            "", 
+            as_string
+        )
+        as_string = as_string.replace(token, new_v)
+
+    return as_string
+
+def find_last(seq, item):
+    return len(seq) - seq[::-1].index(item) - 1
 
 def zip_dicts(*dicts):
     """
@@ -144,10 +165,14 @@ def color_matching(seq_a, seq_b):
 
 
 class RenewableGenerator:
-    def __init__(self, fn):
+    def __init__(self, fn, len):
         self.fn = fn
         self.iter = None
-    
+        self.len = len
+
+    def __len__(self):
+        return self.len
+
     def __iter__(self):
         self.iter = self.fn()
         return self
@@ -156,10 +181,19 @@ class RenewableGenerator:
         return next(self.iter)
 
 
+def top_sort_build_tree(dep_dict: dict, visited_datagen: datagen.Node):
+    if visited_datagen.get_children():
+        dep_dict[visited_datagen] = []
+        for child in visited_datagen.get_children():
+            if child.get_children():
+                dep_dict[visited_datagen].append(child)
+                top_sort_build_tree(dep_dict, child)
+
+
 class PLBart(pl.LightningModule):
     def __init__(self, *, 
             model, 
-            tokenizer, 
+            tokenizer: our_tokenizer.Tokenizer, 
             train_ds, 
             eval_ds, 
             train_batch_size, 
@@ -169,14 +203,14 @@ class PLBart(pl.LightningModule):
             learning_rate,
             is_adamw,
             weight_decay,
-            scheduler_type,
-            scheduler_kwargs,
-            do_allen_nlp_predictions: bool,
+            # scheduler_type,
+            # scheduler_kwargs,
+            # do_allen_nlp_predictions: bool,
             curriculum_mode: str,
-            curriculum_instance,
             max_generation_quantity_valid: int,
         ):
         super().__init__()
+        self.mask_intermediate_labels = isinstance(train_ds, our_datasets.SelfLearnedBasicDataset)
         self.shuffle_train =            False
         self.shuffle_val =              False
         self.tokenizer =                tokenizer
@@ -191,7 +225,6 @@ class PLBart(pl.LightningModule):
                                             logger=   True
                                         )
         self.max_generation_quantity_valid = max_generation_quantity_valid
-        # self.do_allen_nlp_predictions = do_allen_nlp_predictions
 
         # Related to datasets
         self.train_ds =                 train_ds
@@ -207,216 +240,274 @@ class PLBart(pl.LightningModule):
         # self.scheduler_type =         scheduler_type
         # self.scheduler_kwargs =       scheduler_kwargs
 
-        # # Experimental
-        # self.allen_ai_bart =          allen_ai_bart.BartReuser(
-        #                                   model=self.model, 
-        #                                   model_name=self.tokenizer.name_or_path, 
-        #                                   vocab=allennlp.data.Vocabulary.from_pretrained_transformer(
-        #                                       self.tokenizer.name_or_path), 
-        #                                   max_decoding_steps=generation_kwargs["max_length"],
-        #                                   beam_size=generation_kwargs["num_beams"],
-        #                               )
-
         # Curriculum
         self.curriculum_mode =          curriculum_mode
-        self.cluster_picker =           curriculum_instance
-        self.already_started =          False
+        assert "max_length" not in self.generation_kwargs, "the max length is computed dynamically"
 
-    def forward(self, *args, **kwargs):
+    def on_train_epoch_start(self):
+        if isinstance(self.train_ds, our_datasets.CurriculumSelfLearned):
+            assert False
+            self.train_ds.mix(
+                {
+                    0: 1., 
+                    1: 1., 
+                    2: 1.,
+                }
+            )
+
+    def on_validation_start(self) -> None:
+        if isinstance(self.eval_ds, our_datasets.CurriculumSelfLearned):
+            assert False
+            self.eval_ds.mix(
+                {
+                    0: 1., 
+                    1: 1., 
+                    2: 1.,
+                }
+            )
+
+    def forward(self, **kwargs):
         if "decoder_input_ids_for_gen" in kwargs:
             kwargs = {
                 k: w for k, w in kwargs.items() 
                 if k != "decoder_input_ids_for_gen" and k != "decoder_attention_mask_for_gen"
             }
-        return self.model(*args, **kwargs)
+
+        assert self.model.config.bos_token_id not in kwargs["labels"]
+        return self.model(**kwargs)
 
     def training_step(self, batch, batch_idx):
+        
         outputs = self(**batch)
         self.log("train_loss", outputs.loss, **self.logging_conf)
         return outputs.loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx):
-        # self.allen_ai_bart.training = False
         loss: torch.Tensor = self(**batch).loss
         things_to_log = dict(eval_loss=loss)
         per_batch_preds = None
-
-
         self.model = self.model.eval()
-        if batch_idx % 100 == 0:
-            if ValidModes.per_batch in ACTIVE_MODES:
-                per_batch_preds = {}
-                for is_freeform in FREEFORM_OPTIONS:
+
+        #######################################################################
+        # Print every N batches
+        #######################################################################
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Batch mode inference
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if ValidModes.per_batch in ACTIVE_MODES:
+            per_batch_preds = {}
+            for is_freeform in FREEFORM_OPTIONS:
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Prep the argumetns.
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # We copy the dict because we will modify it.
+                generation_kwargs = dict(**self.generation_kwargs)
+                # Freeform mode doesn't need `decode_input_ids_for_gen`, & basic mode 
+                # only has a freeform mode.
+                if not is_freeform:
+                    assert (
+                        "decoder_input_ids_for_gen" in batch or 
+                        not self.eval_ds.has_decoder_input_ids_for_gen
+                    )
+                    
+                    if self.eval_ds.has_decoder_input_ids_for_gen:
+                        # We truncate the decoder_input_ids to the max length.
+                        generation_kwargs["decoder_input_ids"] = (
+                            batch["decoder_input_ids_for_gen"][:, :MAX_TOTAL_GEN_LENGTH])
+                    
+                # Freeform always potentially generates all the way. 
+                # In othercases, we either generate MAX_ANSWER_GEN more tokens or 
+                # stop at the end of the max total length.
+                if is_freeform or not self.eval_ds.has_decoder_input_ids_for_gen:
+                    max_length = MAX_TOTAL_GEN_LENGTH
+                else:
+                    max_length = min(
+                        generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN, 
+                        MAX_TOTAL_GEN_LENGTH
+                )
+
+                # Run inference.
+                per_batch_preds[is_freeform] = GEN_FUNCTION(
+                    self.model,
+                    input_ids      =batch["input_ids"], 
+                    attention_mask =batch["attention_mask"],
+                    max_length     =max_length,
+                    **generation_kwargs, 
+                )
+
+        # Initialize metrics
+        em = {
+            mode: {
+                k: our_metrics.EM() for k in FREEFORM_OPTIONS 
+                if not (mode == ValidModes.per_sample and k)
+            } for mode in ACTIVE_MODES
+        }
+
+        ###################################################################
+        # Examine the samples and predictions one by one.
+        # In per_sample mode, also do predictions.
+        ###################################################################
+        for i, pack in enumerate(tqdm(
+            zip_dicts(batch), desc="Validating", total=len(batch["input_ids"])
+        )):
+            do_print = i < 5
+
+            if do_print:
+                print("#" * 80)
+
+            for is_freeform in FREEFORM_OPTIONS:
+                if i >= self.max_generation_quantity_valid:
+                    break
+                
+                # TODO: wtf is this
+                per_batch_pred = None
+                if ValidModes.per_batch in ACTIVE_MODES:
+                    sample = pack
+                    per_batch_pred = per_batch_preds[is_freeform][i]
+                per_sample_pred = None
+
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Freeform mode doesn't neeed to be done in per sample mode
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                not_necessary = is_freeform and ValidModes.per_batch in ACTIVE_MODES
+                if ValidModes.per_sample in ACTIVE_MODES and not not_necessary:
+                    sample = pack
                     generation_kwargs = dict(**self.generation_kwargs)
-                    if not is_freeform:
-                        generation_kwargs["decoder_input_ids"] = batch["decoder_input_ids_for_gen"]
-                        # generation_kwargs["decoder_attention_mask"] = batch["decoder_input_ids_for_gen"] != self.tokenizer.pad_token_id
-                        
-                    per_batch_preds[is_freeform] = GEN_FUNCTION(
+
+                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                    # Prep decoder input ids
+                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+                    if self.eval_ds.has_decoder_input_ids_for_gen and not is_freeform:
+                        took_out_pad_tokens = [
+                            x for x in sample["decoder_input_ids_for_gen"] 
+                            if x != self.tokenizer.pad_token_id
+                        ]
+                        generation_kwargs["decoder_input_ids"] = torch.stack(
+                            took_out_pad_tokens).reshape(1, -1)[:, :MAX_TOTAL_GEN_LENGTH]
+
+                    assert sample["input_ids"] is not None
+                    assert sample["attention_mask"] is not None
+
+                    if is_freeform or not self.eval_ds.has_decoder_input_ids_for_gen:
+                        max_length = MAX_TOTAL_GEN_LENGTH
+                    else:
+                        max_length = min(
+                            generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN, 
+                            MAX_TOTAL_GEN_LENGTH
+                        )
+                    
+
+                    per_sample_pred = GEN_FUNCTION(
                         self.model,
-                        input_ids=              batch["input_ids"], 
-                        attention_mask=         batch["attention_mask"],
-                        max_length = MAX_TOTAL_GEN_LENGTH if is_freeform else generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN,
+                        input_ids      =sample["input_ids"].reshape(1, -1), 
+                        attention_mask =sample["attention_mask"].reshape(1, -1), 
+                        max_length     =max_length,
                         **generation_kwargs, 
                     )
-    
-            em = {
-                mode: {
-                    k: our_metrics.EM() for k in FREEFORM_OPTIONS if not (mode == ValidModes.per_sample and k)
-                } for mode in ACTIVE_MODES
-            }
-            for i, pack in enumerate(tqdm(
-                zip_dicts(batch), desc="Validating", total=len(batch["input_ids"])
-            )):
-                do_print = batch_idx == 0 and i < 5
-
-                if do_print:
-                    print("#" * 80)
-
-                for is_freeform in FREEFORM_OPTIONS:
-
-                    freeform_maybe = "_freeform" if is_freeform else ""
-
-                    if i >= self.max_generation_quantity_valid:
-                        break
                     
-                    per_batch_pred = None
-                    if ValidModes.per_batch in ACTIVE_MODES:
-                        sample = pack
-                        per_batch_pred = per_batch_preds[is_freeform][i]
+                    assert len(per_sample_pred) == 1, per_sample_pred.shape
+                    assert len(per_sample_pred.shape) == 2, per_sample_pred.shape
+                    per_sample_pred = per_sample_pred[0]
 
-                    per_sample_pred = None
-
-                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                    # Freeform mode doesn't neeed to be done in per sample mode
-                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                    not_necessary = is_freeform and ValidModes.per_batch in ACTIVE_MODES
-                    if ValidModes.per_sample in ACTIVE_MODES and not not_necessary:
-                        sample = pack
-                        generation_kwargs = dict(**self.generation_kwargs)
-
-                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                        # Prep decoder input ids
-                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                        have_input_ids_to_provide = "decoder_input_ids_for_gen" in pack
-                        have_to_provide_decoder_input_ids = not is_freeform
-                        assert (not have_to_provide_decoder_input_ids or have_input_ids_to_provide)
-                        if have_input_ids_to_provide and have_to_provide_decoder_input_ids:
-                            took_out_pad_tokens = [
-                                x for x in sample["decoder_input_ids_for_gen"] 
-                                if x != self.tokenizer.pad_token_id
-                            ]
-                            generation_kwargs["decoder_input_ids"] = (
-                                torch.stack(took_out_pad_tokens).reshape(
-                                    1, -1)[:, :generation_kwargs["max_length"] - 1]
-                            )
-                        
-                        assert sample["input_ids"] is not None
-                        assert sample["attention_mask"] is not None
-
-                        per_sample_pred = GEN_FUNCTION(
-                            self.model,
-                            input_ids=sample["input_ids"].reshape(1, -1), 
-                            attention_mask=sample["attention_mask"].reshape(1, -1), 
-                            **generation_kwargs, 
-                            max_length=(
-                                MAX_TOTAL_GEN_LENGTH if is_freeform else 
-                                generation_kwargs["decoder_input_ids"].shape[1] + MAX_ANSWER_GEN
-                            )
-                        )
-                        
-                        assert len(per_sample_pred) == 1, per_sample_pred.shape
-                        assert len(per_sample_pred.shape) == 2, per_sample_pred.shape
-                        per_sample_pred = per_sample_pred[0]
-
-                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                    # File the predictions per mode 
-                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                    pred_per_mode = {}
-                    if ValidModes.per_sample in ACTIVE_MODES and not not_necessary:
-                        pred_per_mode[ValidModes.per_sample] = per_sample_pred
-                    if ValidModes.per_batch in ACTIVE_MODES:
-                        pred_per_mode[ValidModes.per_batch] = per_batch_pred
-                    
-                    for mode, pred in pred_per_mode.items():
-                        cleaned = our_metrics.OurMetric.prepare(
-                            self.tokenizer, pred, sample["labels"], do_print=False
-                        )
-
-                        clean_pred  = cleaned["cleaned_preds"]
-                        clean_label = cleaned["cleaned_labels"]
-                        
-                        if do_print:
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            # Prep per-sample outputs
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            cleaned_inputs = clean_sample_for_logging(sample['input_ids'], self.tokenizer)
-                            cleaned_labels = clean_sample_for_logging(sample['labels']   , self.tokenizer)
-                            cleaned_gen    = clean_sample_for_logging(pred               , self.tokenizer)
-                            cleaned_decoder_input_ids = None
-                            
-                            if "decoder_input_ids" in generation_kwargs:
-                                if mode == ValidModes.per_sample:
-                                    assert len(generation_kwargs["decoder_input_ids"].shape) == 2, generation_kwargs['decoder_input_ids'].shape     
-                                    assert generation_kwargs["decoder_input_ids"].shape[0] == 1, generation_kwargs['decoder_input_ids'].shape
-                                    cleaned_decoder_input_ids = clean_sample_for_logging(generation_kwargs["decoder_input_ids"][0], self.tokenizer)
-                                    ids = generation_kwargs["decoder_input_ids"][0]
-                                elif ValidModes.per_batch:
-                                    cleaned_decoder_input_ids = clean_sample_for_logging(sample["decoder_input_ids_for_gen"], self.tokenizer)
-                                    ids = sample["decoder_input_ids_for_gen"]
-                                else:
-                                    raise ValueError(f"Unknown mode {mode}")
-
-                                pos_embs = ((ids != self.tokenizer.pad_token_id).cumsum(-1) - 1).detach().cpu()
-                                del ids
-                                pos_embs.masked_fill_(pos_embs < 0, 0)
-                                pos_embs = pos_embs.numpy().tolist()
-
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            # Print them
-                            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                            rich.print(f"[black bold]{mode} {'Freeform' if is_freeform else 'Not-Freeform'}:")
-                            rich.print(f"Inputs:[blue]         \"{cleaned_inputs}\"")
-
-                            if cleaned_decoder_input_ids:
-                                rich.print(f"Decoder Inputs:[blue] \"{cleaned_decoder_input_ids}\"")
-                                # rich.print(f"Decoder ~posem:[blue] \"{' '.join(str(x) for x in pos_embs)}\"")
-
-                            rich.print(f"Gen:[blue]            \"{cleaned_gen}\"")
-                            rich.print(f"Label:[blue]          \"{cleaned_labels}")
-
-                            idx_colored_a, idx_colored_b = color_matching(clean_pred, clean_label)
-                            rich.print(f"(EM) Answer:    " + ", ".join(idx_colored_a))
-                            rich.print(f"(EM) Label:     " + ", ".join(idx_colored_b))
-                            print("~" * 80)
-
-                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                        # Update Metrics
-                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                        if not (mode == ValidModes.per_sample and is_freeform):
-                            em[mode][is_freeform].add(
-                                clean_pred, clean_label, do_print=False, descr=None,
-                            )
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # File the predictions per mode 
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                pred_per_mode = {}
+                if ValidModes.per_sample in ACTIVE_MODES and not not_necessary:
+                    pred_per_mode[ValidModes.per_sample] = per_sample_pred
+                if ValidModes.per_batch in ACTIVE_MODES:
+                    pred_per_mode[ValidModes.per_batch ] = per_batch_pred
                 
-            ###############################################################
-            # Compute and print per batch metrics
-            ###############################################################
-            for is_freeform in FREEFORM_OPTIONS:
-                for mode in ACTIVE_MODES:
-                    if is_freeform and mode == ValidModes.per_sample:
-                        continue
-                    
-                    em_obj = em[mode][is_freeform]
-
-
-                    freeform_maybe = (
-                        "_freeform" if (is_freeform and not mode == ValidModes.per_sample) else ""
+                for mode, pred in pred_per_mode.items():
+                    cleaned = our_metrics.OurMetric.prepare(
+                        self.tokenizer, pred, sample["labels"], do_print=False
                     )
-                    em_acc_val = em_obj.compute()
-                    things_to_log[f"EM{freeform_maybe}"] = em_acc_val
-                    ratio = em_obj.correct / em_obj.total
-                    rich.print(f"[orange]GOT{freeform_maybe}_{mode} {em_obj.correct}/{em_obj.total} = {ratio:.2%}\n")
-        
+                    
+                    clean_pred  = cleaned["cleaned_preds" ]
+                    clean_label = cleaned["cleaned_labels"]
+
+                    if self.eval_ds.has_decoder_input_ids_for_gen and not is_freeform:
+                        clean_pred  = clean_pred [find_last(clean_pred , self.tokenizer.token_to_idx["="]):]
+                        clean_label = clean_label[find_last(clean_label, self.tokenizer.token_to_idx["="]):]
+                    
+                    if do_print:
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        # Prep per-sample outputs
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        rich.print("Raw `input_ids`:\n", sample["input_ids"])
+                        if not is_freeform and self.eval_ds.has_decoder_input_ids_for_gen:
+                            rich.print("Raw `decoder_input_ids_for_gen`:\n", sample["decoder_input_ids_for_gen"])
+                        rich.print("Raw Pred:\n", pred)
+                        rich.print("Raw `labels`:\n", sample["labels"])
+
+                        cleaned_inputs = clean_sample_for_logging(sample['input_ids'], self.tokenizer)
+                        cleaned_labels = clean_sample_for_logging(sample['labels']   , self.tokenizer)
+                        cleaned_gen    = clean_sample_for_logging(pred               , self.tokenizer)
+                        cleaned_decoder_input_ids = None
+                        
+                        if "decoder_input_ids" in generation_kwargs:
+                            if mode == ValidModes.per_sample:
+                                assert len(generation_kwargs["decoder_input_ids"].shape) == 2, (
+                                    generation_kwargs['decoder_input_ids'].shape)
+                                assert generation_kwargs["decoder_input_ids"].shape[0] == 1, (
+                                    generation_kwargs['decoder_input_ids'].shape)
+                                cleaned_decoder_input_ids = clean_sample_for_logging(
+                                    generation_kwargs["decoder_input_ids"][0], self.tokenizer)
+                                ids = generation_kwargs["decoder_input_ids"][0]
+                            elif ValidModes.per_batch:
+                                cleaned_decoder_input_ids = clean_sample_for_logging(
+                                    sample["decoder_input_ids_for_gen"], self.tokenizer)
+                                ids = sample["decoder_input_ids_for_gen"]
+                            else:
+                                raise ValueError(f"Unknown mode {mode}")
+
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        # Print them
+                        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                        # rich.print(f"[black bold]{mode} {'Freeform' if is_freeform else 'Not-Freeform'}:")
+                        rich.print(f"Inputs:\n[blue]\"{cleaned_inputs}\"")
+
+                        if cleaned_decoder_input_ids:
+                            rich.print(f"Decoder Inputs:\n[blue]\"{cleaned_decoder_input_ids}\"")
+
+                        rich.print(f"Gen:\n[blue]\"{cleaned_gen}\"")
+                        rich.print(f"Label:\n[blue]     \"{cleaned_labels}\"")
+
+                        idx_colored_a, idx_colored_b = color_matching(clean_pred, clean_label)
+                        rich.print(f"clean_pred:  ", clean_pred)
+                        rich.print(f"clean_label: ", clean_label)
+                        rich.print(f"(EM) Answer: " + ", ".join(idx_colored_a))
+                        rich.print(f"(EM) Label:  "  + ", ".join(idx_colored_b))
+                        print("~" * 80)
+
+                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                    # Update Metrics
+                    #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                    if not (mode == ValidModes.per_sample and is_freeform):
+                        em[mode][is_freeform].add(
+                            clean_pred, clean_label, do_print=False, descr=None,
+                        )
+            
+        ###############################################################
+        # Compute and print per batch metrics
+        ###############################################################
+        for is_freeform in FREEFORM_OPTIONS:
+            for mode in ACTIVE_MODES:
+                if is_freeform and mode == ValidModes.per_sample:
+                    continue
+                
+                em_obj = em[mode][is_freeform]
+
+
+                freeform_maybe = (
+                    "_freeform" if (is_freeform and not mode == ValidModes.per_sample) else ""
+                )
+                em_acc_val = em_obj.compute()
+                things_to_log[f"EM{freeform_maybe}"] = em_acc_val
+                ratio = em_obj.correct / em_obj.total
+                rich.print(f"[orange]GOT{freeform_maybe}_{mode} {em_obj.correct}/{em_obj.total} = {ratio:.2%}\n")
+    
         self.model = self.model.train()
         self.log_dict(things_to_log, **self.logging_conf)
 
@@ -452,6 +543,8 @@ class PLBart(pl.LightningModule):
         collator = our_data_collator.DataCollatorWithDecoderInputIds(
             self.tokenizer, 
             model=self.model, 
+            max_length=self.tokenizer.max_length,
+            mask_intermediate_labels=self.mask_intermediate_labels,
         )
 
         if shuffle:
@@ -459,22 +552,8 @@ class PLBart(pl.LightningModule):
         else:
             indices = np.arange(len(ds))
 
-        if CONC_MODE != "yield":
-            assert False, "Not supported anymore"
-            yield from concurrent.start(
-                indices, 
-                batch_size, 
-                PIPE_TYPE, 
-                dl_name, 
-                ds, 
-                collator, 
-                self.model, 
-                self.tokenizer, 
-                self.generation_kwargs, 
-                LOOP_WAIT_SEC, 
-                POOL_CONSTRUCTOR,
-            )
-        else:
+        
+        if CONC_MODE == "yield":
             for i in tqdm(range(0, len(ds), batch_size), desc=f"progress in {dl_name}"):
                 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # 
@@ -543,14 +622,14 @@ class PLBart(pl.LightningModule):
                         # Do the prediction
                         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # rich.print(f"[redbold]{len(without_logging_info) = } / {batch_size}")
-                        outputs = concurrent.actual_prediction(
+                        outputs = concurrent_parts.actual_prediction(
                             batch=without_logging_info,
                             collator=collator, 
                             model=self.model, 
-                            tokenizer=self.tokenizer, 
                             generation_kwargs=self.generation_kwargs,
                             gen_function=GEN_FUNCTION,
                             max_answer_gen=MAX_ANSWER_GEN,
+                            max_total_gen_length=MAX_TOTAL_GEN_LENGTH,
                             )
                         
 
@@ -576,6 +655,59 @@ class PLBart(pl.LightningModule):
                 
                 yield collator(final_values)
 
+        if CONC_MODE == "top_sort":
+            assert False
+            for i in tqdm(range(0, len(ds), batch_size), desc=f"progress in {dl_name}"):
+                batch_indices = indices[i:i + batch_size]
+                root_nodes = [ds.get(i) for i in batch_indices]
+                sorters = [] # 1 to 1 with root nodes, ok
+
+                for root_node in root_nodes:
+                    tree = {}
+                    top_sort_build_tree(tree, root_node)
+                    sorter = graphlib.TopologicalSorter(tree)
+                    sorter.prepare()
+                    sorters.append(sorter)
+                
+                at_least_one = True
+                while at_least_one:
+                    at_least_one = False
+                    node_batch: List[datagen.Node] = []
+                    nodes_to_sorters = {}
+                    for sorter in sorters:
+                        if sorter.is_active():
+                            nodes = sorter.get_ready()
+                            for node in nodes:
+                                nodes_to_sorters[node] = sorter
+                            node_batch.extend()
+
+                    input_ids = [self.tokenizer(node.get_input_str()) for node in node_batch]
+                    decoder_input_ids = [self.tokenizer(node.get_pseudo_topsort_query()) for node in node_batch]
+                    batch = dict(input_ids=input_ids, decoder_input_ids=decoder_input_ids, labels=labels)
+                    outputs = concurrent_parts.actual_prediction(
+                            batch=all_queries,
+                            collator=collator, 
+                            model=self.model, 
+                            generation_kwargs=self.generation_kwargs,
+                            gen_function=GEN_FUNCTION,
+                            max_answer_gen=MAX_ANSWER_GEN,
+                            max_total_gen_length=MAX_TOTAL_GEN_LENGTH,
+                        )
+
+                    for node, output in zip(sorters, node_batch, outputs):
+                        text = self.tokenizer.decode(output.detach().cpu().numpy().tolist())
+                        node.set_pseudo_value(text.split("=")[-1])
+                        node_to_sorter[node].done(node)
+                
+                    for sorter in sorters:
+                        if sorter.is_active():
+                            at_least_one = True
+                            break
+
+                # TODO: Build final values.
+                # TODO: This means, do the -100 stuff.
+                yield 
+
     @beartype
     def _make_regular_dataloader(
         self, 
@@ -592,6 +724,8 @@ class PLBart(pl.LightningModule):
                 collate_fn=our_data_collator.DataCollatorWithDecoderInputIds(
                     self.tokenizer, 
                     model=self.model, 
+                    max_length=self.tokenizer.max_length,
+                    mask_intermediate_labels=self.mask_intermediate_labels,
                 ), 
                 batch_size=batch_size, 
                 num_workers=self.num_workers_dl,
@@ -600,13 +734,19 @@ class PLBart(pl.LightningModule):
 
     def train_dataloader(self):
         if isinstance(self.train_ds, our_datasets.SelfLearnedBasicDataset):
+            if self.train_ds.has_len():
+                num_batches = math.ceil(len(self.train_ds) / self.batch_size)
+            else:
+                num_batches = None
+
             return RenewableGenerator(
                 lambda: self._make_dataloader(
                     self.train_ds, 
                     self.batch_size,
                     shuffle=self.shuffle_train,
                     dl_name="train_dl"
-                )
+                ),
+                len=num_batches,
             )
         else:
             return self._make_regular_dataloader(
@@ -617,13 +757,19 @@ class PLBart(pl.LightningModule):
 
     def val_dataloader(self):
         if isinstance(self.eval_ds, our_datasets.SelfLearnedBasicDataset):
+            if self.eval_ds.has_len():
+                num_batches = math.ceil(len(self.eval_ds) / self.batch_size)
+            else:
+                num_batches = None
+
             return RenewableGenerator(
                 lambda: self._make_dataloader(
                     self.eval_ds, 
                     self.batch_size,
                     shuffle=self.shuffle_val,
                     dl_name="val_dl"
-                )
+                ),
+                len=num_batches,
             )
         else:
             return self._make_regular_dataloader(
@@ -637,26 +783,23 @@ def main(
     dataset_type="oracle_basic_dataset", 
     dataset_path=None, 
     dicts_path=SCRIPT_DIR / "data" / "dicts.pkl",
-):
-    
-    if MULTIPROCESSING_METHOD:
-        multiprocessing.set_start_method(MULTIPROCESSING_METHOD)
-    
-    LEARNING_RATE = 0.001
+): 
     NUM_GPUS = 1
-    
-    EVAL_EVERY_N_EPOCHS = 1
     WANDB_ENTITY = "julesgm"
     WANDB_PROJECT = "self_learned_explanations"
     TRAIN_BATCH_SIZE = BATCH_SIZE
     MAX_GENERATION_QUANTITY_VALID = min(128, TRAIN_BATCH_SIZE)
     EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE
     PRECISION = 16
-    GRADIENT_CLIP_VAL = 0.1
 
     dataset = datagen.load_dataset(dataset_path, dicts_path)
+    
+    for v in dataset.values():
+        random.shuffle(v)
+
     train_ds = {k: v[:len(v) // 2] for k, v in dataset.items()}
     valid_ds = {k: v[len(v) // 2:] for k, v in dataset.items()}
+    
     tokenizer = our_tokenizer.Tokenizer(max_length=1024, use_equal_symbol=True)
     train_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](train_ds, tokenizer)
     valid_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](valid_ds, tokenizer)
@@ -682,10 +825,10 @@ def main(
     ###############################################################
     # Can change
     ###############################################################
-    config.num_hidden_layers = 2 # Default is 6
-    config.hidden_size = 128 # Default is 768
-    config.encoder_attention_heads = 4 # Default is 16
-    config.decoder_attention_heads = 4 # Default is 16
+    config.num_hidden_layers = N_LAYERS # Default is 6
+    config.hidden_size = H_SIZE # Default is 768
+    config.encoder_attention_heads = N_HEADS # Default is 16
+    config.decoder_attention_heads = N_HEADS # Default is 16
     config.encoder_ffn_dim = config.hidden_size * 4 # Default is 4096
     config.decoder_ffn_dim = config.hidden_size * 4
 
@@ -711,11 +854,10 @@ def main(
     ):
         train_torch_dataset.set_conc_mode(CONC_MODE)
         valid_torch_dataset.set_conc_mode(CONC_MODE)
+        train_torch_dataset.set_mask_intermediate_labels(True)
+        valid_torch_dataset.set_mask_intermediate_labels(True)
 
-        if CONC_MODE == "pool":
-            functor = concurrent.SendPullPredFunctor(tokenizer)
-            train_torch_dataset.set_pred_functor(functor)
-            valid_torch_dataset.set_pred_functor(functor)
+        assert CONC_MODE == "yield"
         
 
     pl_object = PLBart(
@@ -729,32 +871,30 @@ def main(
         generation_kwargs=GENERATION_KWARGS,
         learning_rate=LEARNING_RATE,
         is_adamw=True,
-        weight_decay=0,
-        scheduler_type="WarmupLinear",
-        scheduler_kwargs=dict(),
-        do_allen_nlp_predictions=False,
+        weight_decay=WEIGHT_DECAY,
+        # scheduler_type="WarmupLinear",
+        # scheduler_kwargs=dict(),
+        # do_allen_nlp_predictions=False,
         curriculum_mode=None,
-        curriculum_instance=None,
         max_generation_quantity_valid=MAX_GENERATION_QUANTITY_VALID,
     )
-    try:
-        logger = pl.loggers.WandbLogger(
-            project=WANDB_PROJECT, 
-            name=run_name, 
-            entity=WANDB_ENTITY,
-            log_model=False, 
-            config=dict(
-                **vars(config), 
-                train_batch_size=TRAIN_BATCH_SIZE, 
-                eval_batch_size=EVAL_BATCH_SIZE, 
-                num_gpus=NUM_GPUS, 
-                approach_type=train_torch_dataset.__class__.__name__, 
-                precision=PRECISION, bart_config=vars(config), 
-                generation_kwargs=GENERATION_KWARGS,
-            )
+
+    logger = pl.loggers.WandbLogger(
+        project=WANDB_PROJECT, 
+        name=run_name, 
+        entity=WANDB_ENTITY,
+        log_model=False, 
+        config=dict(
+            **vars(config), 
+            train_batch_size=TRAIN_BATCH_SIZE, 
+            eval_batch_size=EVAL_BATCH_SIZE, 
+            num_gpus=NUM_GPUS, 
+            approach_type=train_torch_dataset.__class__.__name__, 
+            precision=PRECISION, bart_config=vars(config), 
+            generation_kwargs=GENERATION_KWARGS,
         )
-    except ConnectionRefusedError:
-        logger = None
+    )
+    wandb.run.log_code(SCRIPT_DIR)
 
     trainer = pl.Trainer(
         logger=logger,
@@ -762,7 +902,6 @@ def main(
         precision=PRECISION,
         max_epochs=1000, 
         gpus=NUM_GPUS,
-        # val_check_interval=1000,
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
         limit_val_batches=NUM_BATCHES_VALID,
     )
