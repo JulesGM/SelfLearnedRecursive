@@ -62,7 +62,7 @@ MAX_TOTAL_GEN_LENGTH = 88
 GRADIENT_CLIP_VAL = 0.1
 
 GENERATION_KWARGS = dict(
-    num_beams=4,
+    num_beams=1,
     use_cache=True,
 
     # Should never hange:
@@ -253,7 +253,6 @@ class PLBart(pl.LightningModule):
 
     def on_train_epoch_start(self):
         if isinstance(self.train_ds, our_datasets.CurriculumSelfLearned):
-            assert False
             self.train_ds.mix(
                 {
                     0: 1., 
@@ -264,7 +263,6 @@ class PLBart(pl.LightningModule):
 
     def on_validation_start(self) -> None:
         if isinstance(self.eval_ds, our_datasets.CurriculumSelfLearned):
-            assert False
             self.eval_ds.mix(
                 {
                     0: 1., 
@@ -816,16 +814,24 @@ def main(
     ###############################################################
     config = transformers.BartConfig.from_pretrained("facebook/bart-base")
     config.no_repeat_ngram_size = 0
+    assert "pad_token_id" in config.__dict__
+    assert "eos_token_id" in config.__dict__
+    assert "bos_token_id" in config.__dict__
+    assert "forced_bos_token_id" in config.__dict__
+    assert "forced_eos_token_id" in config.__dict__
+    assert "decoder_start_token_id" in config.__dict__
+
+
     config.pad_token_id = tokenizer.pad_token_id
-    config.decoder_start_token_id = tokenizer.bos_token_id
+    config.decoder_start_token_id = tokenizer.decoder_start_token_id
     config.bos_token_id = tokenizer.bos_token_id
     config.eos_token_id = tokenizer.eos_token_id
     assert config.eos_token_id != config.pad_token_id, (
         f"eos_token_id and pad_token_id should not be the same. eos_token_id:"
         f" {config.eos_token_id}, pad_token_id: {config.pad_token_id}"
     )
-    config.forced_bos_token_id = tokenizer.bos_token_id
-    config.forced_eos_token_id = tokenizer.eos_token_id
+    config.forced_bos_token_id = None
+    config.forced_eos_token_id = None
     config.vocab_size = len(tokenizer.vocab)
     config.task_specific_params = {}
 

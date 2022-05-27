@@ -567,6 +567,14 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
         Returns:
         """
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # assert past_key_values is not None or torch.all(decoder_input_ids[:, 0] == self.config.bos_token_id), (
+            # "The first token of the decoder_input_ids should be the <BOS> token."
+        # )
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if labels is not None:
@@ -574,6 +582,7 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
                 logger.warning("The `use_cache` argument is changed to `False` since `labels` is provided.")
             use_cache = False
             if decoder_input_ids is None and decoder_inputs_embeds is None:
+                assert False
                 decoder_input_ids = original.shift_tokens_right(
                     labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
@@ -606,6 +615,11 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
         masked_lm_loss = None
         if labels is not None:
             loss_fct = original.CrossEntropyLoss()
+            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Jules
+            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            assert self.config.bos_token_id not in labels
+            #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             masked_lm_loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
 
         if not return_dict:
@@ -668,6 +682,7 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
         if past is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
+        
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
@@ -724,15 +739,16 @@ def main(model = None):
     config = transformers.BartConfig.from_pretrained("facebook/bart-base")
     config.no_repeat_ngram_size = 0
     config.pad_token_id = tokenizer.pad_token_id
-    config.decoder_start_token_id = tokenizer.bos_token_id
     config.bos_token_id = tokenizer.bos_token_id
     config.eos_token_id = tokenizer.eos_token_id
+    config.forced_bos_token_id = tokenizer.forced_bos_token_id
+    config.forced_eos_token_id = tokenizer.forced_eos_token_id
+    config.decoder_start_token_id = tokenizer.bos_token_id
+    
     assert config.eos_token_id != config.pad_token_id, (
         f"eos_token_id and pad_token_id should not be the same. eos_token_id:"
         f" {config.eos_token_id}, pad_token_id: {config.pad_token_id}"
     )
-    config.forced_bos_token_id = tokenizer.bos_token_id
-    config.forced_eos_token_id = tokenizer.eos_token_id
     config.vocab_size = len(tokenizer.vocab)
     config.task_specific_params = {}
 

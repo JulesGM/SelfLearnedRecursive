@@ -92,7 +92,7 @@ class DataCollatorWithDecoderInputIds:
         assert self._model.config.pad_token_id == self._tokenizer.pad_token_id, (
             "The pad_token_id of the model must be the same as the one used by the tokenizer"
         )
-        assert self._model.config.decoder_start_token_id == self._tokenizer.bos_token_id
+        # assert self._model.config.decoder_start_token_id == self._tokenizer.bos_token_id
         assert "decoder_attention_mask_for_gen" not in features, features.keys()
 
         keys = features[0].keys()
@@ -161,7 +161,7 @@ class DataCollatorWithDecoderInputIds:
             features["decoder_input_ids_for_gen"] = modeling_bart.shift_tokens_right(
                 features["decoder_input_ids_for_gen"],
                 self._model.config.pad_token_id,
-                self._model.config.bos_token_id,
+                self._model.config.decoder_start_token_id,
             ) 
 
             assert torch.all(
@@ -270,7 +270,7 @@ class DataCollatorDecoderOnly:
             features["decoder_input_ids_for_gen"] = modeling_bart.shift_tokens_right(
                 features["decoder_input_ids_for_gen"],
                 self._model.config.pad_token_id,
-                self._model.config.bos_token_id,
+                self._model.config.decoder_start_token_id,
             ) 
 
             assert torch.all(

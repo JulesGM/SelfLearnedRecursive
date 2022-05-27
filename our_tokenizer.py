@@ -9,35 +9,41 @@ class Tokenizer:
         "token_to_idx",
         "idx_to_token",
         "bos_token",
-        "eos_token",
-        "pad_token",
         "bos_token_id",
+        "decoder_start_token",
+        "decoder_start_token_id",
+        "eos_token",
         "eos_token_id",
+        "pad_token",
         "pad_token_id",
         "padding_side",
         "max_length",
+        "special_token_ids",
     )
 
     def __init__(self, max_length: int, use_equal_symbol: bool):
         self.vocab = [
-            "<pad>",  # 0
-            "<bos>",  # 1
-            "<eos>",  # 2
-            "0",      # 3
-            "1",      # 4
-            "2",      # 5
-            "3",      # 6
-            "4",      # 7
-            "5",      # 8
-            "6",      # 9
-            "7",      # 10
-            "8",      # 11 
-            "9",      # 12
-            "+",      # 13
-            "-",      # 14
-            "*",      # 15
-            "(",      # 16
-            ")",      # 17
+            "<pad>",   # 0
+            "<eos>",   # 1
+            "<forced_eos>",  # 2
+            "<bos>",   # 3
+            "<forced_bos>",   # 4
+            "<start>", # 5
+            "0",       # 6
+            "1",       # 7
+            "2",       # 8
+            "3",       # 9
+            "4",       # 10
+            "5",       # 11
+            "6",       # 12
+            "7",       # 13
+            "8",       # 14 
+            "9",       # 15
+            "+",       # 16
+            "-",       # 17
+            "*",       # 18
+            "(",       # 19
+            ")",       # 20
         ]
 
         if use_equal_symbol:
@@ -46,13 +52,29 @@ class Tokenizer:
         self.token_to_idx = {token: idx for idx, token in enumerate(self.vocab)}
         self.idx_to_token = self.vocab
         self.bos_token = "<bos>"
-        self.eos_token = "<eos>"
-        self.pad_token = "<pad>"
         self.bos_token_id = self.token_to_idx["<bos>"]
+        self.forced_bos_token = "<forced_bos>"
+        self.forced_bos_token_id = self.token_to_idx["<forced_bos>"]
+        self.decoder_start_token = "<start>"
+        self.decoder_start_token_id = self.token_to_idx["<start>"]
+        self.eos_token = "<eos>"
         self.eos_token_id = self.token_to_idx["<eos>"]
+        self.forced_eos_token = "<forced_eos>"
+        self.forced_eos_token_id = self.token_to_idx["<forced_eos>"]
+        self.pad_token = "<pad>"
         self.pad_token_id = self.token_to_idx["<pad>"]
         self.padding_side = "left"
         self.max_length = max_length
+
+        self.special_token_ids = {
+            self.bos_token_id,
+            self.eos_token_id,
+            self.forced_bos_token_id,
+            self.forced_eos_token_id,
+            self.decoder_start_token_id,
+            self.pad_token_id,
+        }
+
 
     def encode(self, input_str: str, return_tensors: str = "np", no_eos: bool = False) -> Sequence:
         assert type(input_str) == str, type(input_str)

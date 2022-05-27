@@ -13,20 +13,10 @@ class OurMetric(abc.ABC):
     def prepare(cls, tokenizer: our_tokenizer.Tokenizer, pred, label, do_print):
         things_to_ignore = {
             -100, 
-            tokenizer.pad_token_id, 
-            tokenizer.bos_token_id, 
-            tokenizer.eos_token_id,
-        }
-        
-        assert 0 in things_to_ignore, things_to_ignore
-        assert 1 in things_to_ignore, things_to_ignore
-        assert 2 in things_to_ignore, things_to_ignore
+        } | tokenizer.special_token_ids
         
         pred = pred.cpu().numpy().tolist()
         label = label.cpu().numpy().tolist()
-
-        if pred[:2] == [tokenizer.bos_token_id] * 2:
-            pred[:2] = [tokenizer.bos_token_id, tokenizer.token_to_idx["("]]
 
         cleaned_preds = [x for x in  pred if x not in things_to_ignore]
         cleaned_labels = [x for x in label if x not in things_to_ignore]
