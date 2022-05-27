@@ -46,7 +46,7 @@ class ValidModes:
 #########################################################################################################
 RUN_NAME_DEFAULT  = "experimentation"
 ACTIVE_MODES      = {ValidModes.per_batch}
-FREEFORM_OPTIONS  = {True}
+FREEFORM_OPTIONS  = {False}
 NUM_BATCHES_VALID = 5
 EVAL_EVERY_N_EPOCHS = 2
 
@@ -178,7 +178,11 @@ class RenewableGenerator:
         return self
     
     def __next__(self):
-        return next(self.iter)
+        features = next(self.iter)
+        for k, v in features.items():
+            if isinstance(v, torch.Tensor):
+                features[k] = v.pin_memory()
+        return features
 
 def top_sort_build_tree(dep_dict: dict, visited_datagen: datagen.Node):
     if visited_datagen.get_children():

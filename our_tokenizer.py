@@ -53,14 +53,10 @@ class Tokenizer:
         self.idx_to_token = self.vocab
         self.bos_token = "<bos>"
         self.bos_token_id = self.token_to_idx["<bos>"]
-        self.forced_bos_token = "<forced_bos>"
-        self.forced_bos_token_id = self.token_to_idx["<forced_bos>"]
         self.decoder_start_token = "<start>"
         self.decoder_start_token_id = self.token_to_idx["<start>"]
         self.eos_token = "<eos>"
         self.eos_token_id = self.token_to_idx["<eos>"]
-        self.forced_eos_token = "<forced_eos>"
-        self.forced_eos_token_id = self.token_to_idx["<forced_eos>"]
         self.pad_token = "<pad>"
         self.pad_token_id = self.token_to_idx["<pad>"]
         self.padding_side = "left"
@@ -69,8 +65,6 @@ class Tokenizer:
         self.special_token_ids = {
             self.bos_token_id,
             self.eos_token_id,
-            self.forced_bos_token_id,
-            self.forced_eos_token_id,
             self.decoder_start_token_id,
             self.pad_token_id,
         }
