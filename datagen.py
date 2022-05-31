@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import collections
 import concurrent.futures as futures
 import dataclasses
+import itertools
 import logging
 import math
 from pathlib import Path
@@ -11,6 +13,8 @@ import time
 from typing import *
 
 from beartype import beartype
+import pretty_traceback
+pretty_traceback.install()
 import numpy as np
 import random
 import rich
@@ -38,8 +42,8 @@ def prep_input_data(
     input_str: str,
     pseudo_without_head: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    input_ids = tokenizer(input_str)
-    decoder_input_ids = tokenizer(pseudo_without_head)
+    input_ids = tokenizer.encode(input_str, "np", no_eos=False)
+    decoder_input_ids = tokenizer.encode(pseudo_without_head, "np", no_eos=False)
     return input_ids, decoder_input_ids
 
 
@@ -55,27 +59,30 @@ def load_dataset(json_path: str, pkl_path: str):
             dicts = json.load(f)
 
     LOGGER.debug(f"Parsing structures from the dicts.")
-    dataset = {}
     top_progress = tqdm(dicts.items())
-    for level_name, node_dict_list in top_progress:
-        top_progress.set_description(f"Parsing {level_name}")
-        dataset[level_name] = []
-        for node_dict in tqdm(node_dict_list, desc=level_name):
-            dataset[level_name].append(Node.from_json_dict(node_dict))
+
+    per_split = collections.defaultdict(dict)
+    for level_name, splits in top_progress:
+        for split_name, split in splits.items():
+            top_progress.set_description(f"Parsing {level_name}")
+            per_split[split_name][level_name] = []
+            for node_dict in tqdm(split, desc=level_name):
+                per_split[split_name][level_name].append(Node.from_json_dict(node_dict))
 
     LOGGER.debug(f"Done loading dataset.")
-    return dataset
+    return per_split
 
 
 class Node:
     __slots__ = (
-        "_op",
         "_children",
-        "_value",
+        "_complexity_level",
         "_input_str",
+        "_pseudo_value",
+        "_op",
         "_oracle_str",
         "_oracle_without_top_val",
-        "_pseudo_value",
+        "_value",
     )
 
     def __init__(
@@ -83,6 +90,7 @@ class Node:
         op: Optional[str],
         children: Optional[List["Node"]],
         value: int,
+        complexity_level: int,
     ):
         self._op: str = op
         self._children: List["Node"] = children
@@ -91,14 +99,22 @@ class Node:
         self._oracle_str: Optional[str] = None
         self._oracle_without_top_val: Optional[str] = None
         self._pseudo_value: Optional[int] = None
+        self._complexity_level: Optional[int] = complexity_level
 
-    def reset_pseudo_values(self):
+    def get_complexity_level(self) -> int:
+        return self._complexity_level
+
+    def set_complexity_level(self, value: int) -> None:
+        assert self._complexity_level is None
+        self._complexity_level = value
+
+    def reset_pseudo_values(self) -> None:
         self._pseudo_value = None
         if self.get_children():
             for child in self.get_children():
                 child.reset_pseudo_values()
 
-    def to_json_dict(self):
+    def to_json_dict(self) -> Dict[str, Any]:
         oracle_str, oracle_without_top_val = self.get_oracle_str()
         return {
             "op": self.get_op(),
@@ -109,6 +125,7 @@ class Node:
             "input_str": self.get_input_str(),
             "oracle_str": oracle_str,
             "oracle_without_top_val": oracle_without_top_val,
+            "complexity_level": self.get_complexity_level(),
         }
 
     @classmethod
@@ -124,6 +141,7 @@ class Node:
                 else None
             ),
             value=json_dict["value"],
+            complexity_level=json_dict["complexity_level"],
         )
         node._input_str = json_dict["input_str"]
         node._oracle_str = json_dict["oracle_str"]
@@ -176,7 +194,7 @@ class Node:
         we need to be given the left part of the final top most equation without
         the right value.
         """
-
+        assert False
         if self.get_children():
             assert len(self.get_children()) == 2, len(self.get_children())
             assert self.get_children()[0].get_pseudo_value() is not None
@@ -199,7 +217,7 @@ class Node:
         we need to be given the left part of the final top most equation without
         the right value.
         """
-
+        assert False
         assert self.get_pseudo_value()
         query = self.get_pseudo_topsort_query()
         if self.get_children():
@@ -267,45 +285,79 @@ class Node:
             else:
                 raise ValueError(f"Unknown conc_mode: {conc_mode}")
 
-            if head_type == "oracle" or head_type == "pred":
-                pseudo_without_head = f"({a_str} {self.get_op()} {b_str} = "
-                if head_type == "oracle":
-                    head = self.get_value()
-                elif head_type == "pred":
-                    if conc_mode == "yield":
-                        head = yield dict(
-                            input_str=self.get_input_str(),
-                            pseudo_without_head=pseudo_without_head,
-                            logging_info=logging_info,
-                        )
-                    else:
-                        raise ValueError(f"Unknown conc_mode: {conc_mode}")
-
-                pseudo_str = f"({a_str} {self.get_op()} {b_str} = {head})"
-
-                potential_head = tokenizer(str(head), None, no_eos=True)
-                if head_type == "pred":
-                    maybe_head_tokens = [-100] * len(potential_head)
-                elif head_type == "oracle":
-                    maybe_head_tokens = potential_head
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Fetch the answer to the problem, either predicted or oracle
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            pseudo_without_head = f"({a_str} {self.get_op()} {b_str} = "
+            if head_type == "oracle":
+                head = self.get_value()
+            elif head_type == "pred":
+                if conc_mode == "yield":
+                    head = yield dict(
+                        input_str=self.get_input_str(),
+                        pseudo_without_head=pseudo_without_head,
+                        logging_info=logging_info,
+                    )
                 else:
-                    raise ValueError(f"Unknown head_type: {head_type}")
+                    raise ValueError(f"Unknown conc_mode: {conc_mode}")
 
-                masked_pseudo = (
-                    tokenizer("(", None, no_eos=True)
-                    + masked_pseudo_a  # (
-                    + tokenizer(self.get_op(), None, no_eos=True)  # a_pseudo
-                    + masked_pseudo_b  # +
-                    + tokenizer("=", None, no_eos=True)  # b_pseudo
-                    + maybe_head_tokens  # =
-                    + tokenizer(")", None, no_eos=True)  # head  # )
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Tokenize it
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            pseudo_str = f"({a_str} {self.get_op()} {b_str} = {head})"
+            potential_head = tokenizer(
+                str(head),
+                return_tensors=None,
+                no_eos=True,
+                strip_special_symbols=True,
+            )
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Log the accuracy of the different levels
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            if head_type == "pred":
+                tokenized_oracle_head = tokenizer(
+                    str(self.get_value()),
+                    return_tensors=None,
+                    no_eos=True,
+                    strip_special_symbols=True,
                 )
+                logging_info.level_accuracy[self._complexity_level].count_total += 1
+                if potential_head == tokenized_oracle_head:
+                    logging_info.level_accuracy[self._complexity_level].count_good += 1
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Prepare the label, where the scratchpad should be masked
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            if head_type == "pred":
+                maybe_head_tokens = [-100] * len(potential_head) + [-100]
+            elif head_type == "oracle":
+                maybe_head_tokens = potential_head + tokenizer(")", None, no_eos=True)
             else:
                 raise ValueError(f"Unknown head_type: {head_type}")
+
+            if head_type == "oracle":
+                equal_token_ids = tokenizer("=", None, no_eos=True)
+            else:
+                equal_token_ids = len(tokenizer("=", None, no_eos=True)) * [-100]
+
+            masked_pseudo = (
+                len(tokenizer("(", None, no_eos=True)) * [-100]
+                + masked_pseudo_a
+                + len(tokenizer(self.get_op(), None, no_eos=True)) * [-100]
+                + masked_pseudo_b
+                + equal_token_ids
+                + maybe_head_tokens
+            )
+
         else:
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # If we are of the zeroth level, just return the real,
+            # & don't alter the accuracy statistics (obviously).
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             pseudo_str = f"{self.get_value()}"
             pseudo_without_head = f""
-            masked_pseudo = tokenizer(pseudo_str, None, no_eos=True)
+            masked_pseudo = [-100] * len(tokenizer(pseudo_str, None, no_eos=True))
 
         assert isinstance(pseudo_str, str), type(pseudo_str)
         assert isinstance(pseudo_without_head, str), type(pseudo_without_head)
@@ -342,6 +394,7 @@ def generate(
                     op=op,
                     children=[a, b],
                     value=opmap[op](a.get_value(), b.get_value()),
+                    complexity_level=None,
                 )
         return
 
@@ -394,6 +447,7 @@ def generate(
                     op=op,
                     children=[a, b],
                     value=opmap[op](a.get_value(), b.get_value()),
+                    complexity_level=None,
                 )
 
 
@@ -430,10 +484,13 @@ def generate_data(
     config: "NestedClacConfig",
 ) -> Tuple[List[Node], List[Node], List[Node]]:
     zeroth_l = [
-        Node(op=None, children=None, value=value)
+        Node(op=None, children=None, value=value, complexity_level=0)
         for value in range(10 ** config.max_digits)
     ]
 
+    ###########################################################################
+    # Prepare the nodes of the first level
+    ###########################################################################
     first_l: List[Node] = []
     # We want all the entries of level 1
     for op in config.operators:
@@ -444,66 +501,130 @@ def generate_data(
                         op=op,
                         children=[a, b],
                         value=opmap[op](a.get_value(), b.get_value()),
+                        complexity_level=1,
                     )
                 )
+    
+    # There are way too few level 1 equations, we use them on both 
+    # validation splits. (There are just 300 total).
+    # We may want to oversample these, too.
+    first_all = first_l
+    first_l = dict(train=first_l, eval=first_l)
 
-    # This is kind of dumb, we should likely just use a random subset of seconds_for_third_l
+    ###########################################################################
+    # Prepare, filter and split all the level 2 eqns
+    ###########################################################################    
     all_second_l = list(
         generate(
             config,
-            first_l,
-            first_l + zeroth_l,
+            first_all,
+            first_all + zeroth_l,
             "all",
             "ALL SECONDS",
         )
     )
-    seconds_for_third_l = all_second_l
+    for node in all_second_l:
+        node.set_complexity_level(2)
 
     tokenizer = our_tokenizer.Tokenizer(512, True)
-    filter_lambda = lambda node: filter_length(
+    filter_length_lambda = lambda node: filter_length(
         node, config.max_answer_length, config.max_total_length, tokenizer
     )
-    third_l = list(
-        generate(
-            config,
-            seconds_for_third_l,
-            seconds_for_third_l + first_l + zeroth_l,
-            config.qty_third_layer,
-            "THIRD",
-            filter_lambda=filter_lambda,
-        )
+    random.shuffle(all_second_l)
+    print("l2 all pre-filter", len(all_second_l))
+    all_second_l = list(filter(filter_length_lambda, all_second_l))
+    print("l2 all post-filter", len(all_second_l))
+    second_l = dict(
+        train=all_second_l[: len(all_second_l) // 2],
+        eval=all_second_l[len(all_second_l) // 2:]
     )
 
-    # Prep the output second_l
-    second_l = list(all_second_l)
-    second_l = list(filter(filter_lambda, second_l))
-    random.shuffle(second_l)
-    second_l = second_l[: config.qty_second_layer]
+    ###########################################################################
+    # Prepare, filter and split all the level 3 eqns
+    ###########################################################################
+    third_l = {}
+    for split_name, split_l2_roots in second_l.items():
+        third_l[split_name] = list(
+            generate(
+                config,
+                split_l2_roots,
+                split_l2_roots + first_all + zeroth_l,
+                config.qty_third_layer * 2,
+                "THIRD",
+                filter_lambda=filter_length_lambda,
+            )
+        )
+        for node in third_l[split_name]:
+            node.set_complexity_level(3)
+        print(f"l3 Pre  filter: {len(third_l[split_name])}")
+        third_l[split_name] = list(filter(filter_length_lambda, third_l[split_name]))
+        random.shuffle(third_l[split_name])
+        third_l[split_name] = third_l[split_name][: config.qty_third_layer]
+        print(f"l3 Post filter: {len(third_l[split_name])}")
 
-    # Prep the output third_l
-    random.shuffle(third_l)
-    third_l = third_l[: config.qty_third_layer]
+    ###########################################################################
+    # Fix the lengths of the second layer.
+    # Needs to be done after level 3 because we don't want to needlessly
+    # throw away level two equations that could be used in level 3.
+    ###########################################################################
+    for k in second_l:
+        second_l[k] = second_l[k][: config.qty_second_layer]
 
+    ################################################################################
+    # Make sure each node has a complexity level
+    # Stack based depth first traversal
+    ################################################################################
+    work_stack: List[Node] = list(
+        itertools.chain(
+            itertools.chain(*first_l .values()), 
+            itertools.chain(*second_l.values()),
+            itertools.chain(*third_l .values()),
+        ),
+    )
+
+    while work_stack:
+        current_node = work_stack.pop()
+        if current_node.get_children():
+            work_stack.extend(current_node.get_children())
+        assert current_node.get_complexity_level() is not None
+
+
+    ################################################################################
+    # Print the lengths
+    ################################################################################
+    lengths_l1 = {k: len(v) for k, v in first_l .items()}
+    lengths_l2 = {k: len(v) for k, v in second_l.items()}
+    lengths_l3 = {k: len(v) for k, v in third_l .items()}
     print("Final lengths:")
-    print(f"\tfirst_l: {len(first_l)}")
-    print(f"\tsecond_l: {len(second_l)}")
-    print(f"\tthird_l: {len(third_l)}")
+    print(f"\tfirst_l:  {lengths_l1}")
+    print(f"\tsecond_l: {lengths_l2}")
+    print(f"\tthird_l:  {lengths_l3}")
 
     return first_l, second_l, third_l
 
 
-@dataclasses.dataclass(frozen=True)
 class PredLogger:
-    __slots__ = ("root",)
-    root: "Node"
+    __slots__ = (
+        # "root",
+        "level_accuracy",
+    )
 
-    def log_doing(self, input_str: str, current_results: str):
-        root_str = self.root.get_input_str()
-        current_str = input_str
-        highlighted = root_str.replace(
-            current_str, f"[green bold]{current_str}[/green bold]"
-        )
-        return f"{highlighted}"
+    @dataclasses.dataclass
+    class Accuracy:
+        count_good: int = 0
+        count_total: int = 0
+
+        def compute(self):
+            return f"{self.count_good}/{self.count_total}, {self.count_good / self.count_total:.1%}"
+
+    def __init__(
+        self,
+    ):
+        self.level_accuracy = collections.defaultdict(self.Accuracy)
+
+    def log(self):
+        for k, v in self.level_accuracy.items():
+            rich.print(f"[bright_cyan]Level {k}[/]: {v.compute()}")
 
 
 @dataclasses.dataclass
@@ -536,10 +657,11 @@ if __name__ == "__main__":
     }
 
     dataset = dict(
-        first=[x.to_json_dict() for x in tqdm(first)],
-        second=[x.to_json_dict() for x in tqdm(second)],
-        third=[x.to_json_dict() for x in tqdm(third)],
+        first ={split: [sample.to_json_dict() for sample in tqdm(samples)] for split, samples in first .items()},
+        second={split: [sample.to_json_dict() for sample in tqdm(samples)] for split, samples in second.items()},
+        third ={split: [sample.to_json_dict() for sample in tqdm(samples)] for split, samples in third .items()},
     )
+
     start = time.perf_counter()
     with open(SCRIPT_DIR / "data" / "dicts.pkl", "bw") as f:
         pickle.dump(dataset, f)

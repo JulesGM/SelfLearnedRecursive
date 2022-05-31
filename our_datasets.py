@@ -92,7 +92,7 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
     ):
         self._mask_intermediate_labels = mask_intermediate_labels
 
-    def get(self, idx: int) -> Dict[str, torch.Tensor]:
+    def get(self, idx: int, pred_logger: datagen.PredLogger) -> Dict[str, torch.Tensor]:
         input_ = self._dataset[idx].get_input_str()
         if self._conc_mode == "top_sort":
             self._dataset[idx].reset_pseudo_values()
@@ -101,7 +101,7 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
             output = yield from self._dataset[idx].get_pseudo(
                 head_type="oracle", 
                 conc_mode=self._conc_mode, 
-                logging_info=datagen.PredLogger(self._dataset[idx]),
+                logging_info=pred_logger,
                 tokenizer=self._tokenizer,
             )
         else:
@@ -112,17 +112,17 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
         assert isinstance(pseudo_str, str), type(pseudo_str)
         assert isinstance(pseudo_without_head, str), type(pseudo_without_head)
 
+        tokenized_pseudo_str = self._tokenizer(pseudo_str)
         ouptut = dict(
             input_ids=self._tokenizer(input_), 
             labels=(
                 masked_intermediate_solutions 
                 if self._mask_intermediate_labels 
-                else self._tokenizer(pseudo_str)
+                else tokenized_pseudo_str
             ),
+            decoder_input_ids=tokenized_pseudo_str,
             decoder_input_ids_for_gen=self._tokenizer(pseudo_without_head),
         )
-        end = time.perf_counter()
-        # rich.print(f"[green]Took {end - start} seconds to get item {idx}")
         return ouptut
 
     def set_conc_mode(self, conc_mode: str) -> None:

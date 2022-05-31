@@ -18,6 +18,7 @@ class Tokenizer:
         "pad_token_id",
         "padding_side",
         "max_length",
+        "special_tokens",
         "special_token_ids",
     )
 
@@ -25,9 +26,7 @@ class Tokenizer:
         self.vocab = [
             "<pad>",   # 0
             "<eos>",   # 1
-            "<forced_eos>",  # 2
             "<bos>",   # 3
-            "<forced_bos>",   # 4
             "<start>", # 5
             "0",       # 6
             "1",       # 7
@@ -62,16 +61,32 @@ class Tokenizer:
         self.padding_side = "left"
         self.max_length = max_length
 
-        self.special_token_ids = {
-            self.bos_token_id,
-            self.eos_token_id,
-            self.decoder_start_token_id,
-            self.pad_token_id,
-        }
+        self.special_tokens = {"<bos>", "<eos>", "<pad>", "<start>"}
+        self.special_token_ids = {self.token_to_idx[token] for token in self.special_tokens}
+
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Checks:
+        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        for token in self.vocab:
+            if token in self.special_tokens:
+                assert token[0] == "<" and token[-1] == ">", token
+            else:
+                assert "<" not in token and ">" not in token, token
+                assert len(token) == 1, token
 
 
-    def encode(self, input_str: str, return_tensors: str = "np", no_eos: bool = False) -> Sequence:
+    def strip_special_tokens(self, input_text):
+        for token in self.special_tokens:
+            input_text = input_text.replace(token, "")
+        return input_text
+
+
+    def encode(self, input_str: str, return_tensors: str = "np", *, no_eos: bool = False, strip_special_symbols: bool = False) -> Sequence:
         assert type(input_str) == str, type(input_str)
+
+        if strip_special_symbols:
+            input_str = self.strip_special_tokens(input_str)
+
         output = []
         for char in input_str:
             if char in self.token_to_idx:
@@ -98,7 +113,12 @@ class Tokenizer:
         return output
     
     def decode(self, input_tokens: List[int], ignore_special_symbols: bool) -> str:
-        assert type(input_tokens) == list, type(input_tokens)
+
+        if isinstance(input_tokens, torch.Tensor):
+            input_tokens = input_tokens.detach().cpu().numpy().tolist()
+        elif isinstance(input_tokens, np.ndarray):
+            input_tokens = input_tokens.tolist()
+
         output = []
         ignore_set = set([self.bos_token_id, self.eos_token_id, self.pad_token_id])
         for token_index in input_tokens:
@@ -166,5 +186,5 @@ class Tokenizer:
         else:
             raise ValueError(f"Unknown return_tensors value '{return_tensors}'")
 
-    def __call__(self, *args, **kwargs):
-        return self.encode(*args, **kwargs)
+
+    __call__ = encode

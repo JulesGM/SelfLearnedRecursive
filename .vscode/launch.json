@@ -12,7 +12,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "--dataset_type", "oracle_basic_dataset", 
+                "--dataset_type", "oracle_basic_dataset", "--freeform_options", "[True, False]",
             ],
         },
         {
@@ -23,7 +23,7 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": [
-                "--dataset_type", "self_learned_basic_dataset", 
+                "--dataset_type", "self_learned_basic_dataset", "--freeform_options", "[False]",
             ],
         },
         {
@@ -34,7 +34,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "--dataset_type", "most_basic_dataset", 
+                "--dataset_type", "most_basic_dataset", "--freeform_options", "[False]",
             ],
         },
         {
