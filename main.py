@@ -810,7 +810,7 @@ def main(
 
     assert dataset_type in our_datasets.DATASET_TYPES, dataset_type
     assert freeform_options, freeform_options
-    assert isinstance(freeform_options, (list, tuple, set))
+    assert isinstance(freeform_options, (list, tuple, set)), freeform_options
     assert all(isinstance(x, bool) for x in freeform_options)
 
     NUM_GPUS = 1
@@ -914,6 +914,7 @@ def main(
         # do_allen_nlp_predictions=False,
         curriculum_mode=None,
         max_generation_quantity_valid=MAX_GENERATION_QUANTITY_VALID,
+        freeform_options=freeform_options,
     )
 
     logger = pl.loggers.WandbLogger(
