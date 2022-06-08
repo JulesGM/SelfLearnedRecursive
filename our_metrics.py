@@ -8,23 +8,21 @@ import numpy as np
 
 import our_tokenizer
 
+
 class OurMetric(abc.ABC):
     @classmethod
     def prepare(cls, tokenizer: our_tokenizer.Tokenizer, pred, label, do_print):
         things_to_ignore = {
-            -100, 
+            -100,
         } | tokenizer.special_token_ids
-        
+
         pred = pred.cpu().numpy().tolist()
         label = label.cpu().numpy().tolist()
 
-        cleaned_preds = [x for x in  pred if x not in things_to_ignore]
+        cleaned_preds = [x for x in pred if x not in things_to_ignore]
         cleaned_labels = [x for x in label if x not in things_to_ignore]
 
-        return dict(
-            cleaned_preds=cleaned_preds, 
-            cleaned_labels=cleaned_labels
-        )
+        return dict(cleaned_preds=cleaned_preds, cleaned_labels=cleaned_labels)
 
     @abc.abstractmethod
     def add(self, *args, **kwargs):
@@ -42,25 +40,41 @@ class EM(OurMetric):
 
     def add(self, pred: list, label: list, do_print=False, descr=""):
         prepped_decoded = list(pred)
-        prepped_label =   list(label)
+        prepped_label = list(label)
 
         if prepped_decoded == prepped_label:
             self.correct += 1
         else:
             pass
-        
-        if do_print:            
-            rich.print(f"(EM) Answer - {descr}: " + ", ".join(
-                [f"[green]{a}" if a == b else f"[red]{a}" for a, b 
-                in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="") if a]
-            ))
-            rich.print(f"(EM) Label  - {descr}: " + ", ".join(
-                [f"[green]{b}" if a == b else f"[red]{b}" for a, b 
-                in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="") if b]
-            ))
 
-        self.total += 1 
-    
+        if do_print:
+            rich.print(
+                f"(EM) Answer - {descr}: "
+                + ", ".join(
+                    [
+                        f"[green]{a}" if a == b else f"[red]{a}"
+                        for a, b in itertools.zip_longest(
+                            prepped_decoded, prepped_label, fillvalue=""
+                        )
+                        if a
+                    ]
+                )
+            )
+            rich.print(
+                f"(EM) Label  - {descr}: "
+                + ", ".join(
+                    [
+                        f"[green]{b}" if a == b else f"[red]{b}"
+                        for a, b in itertools.zip_longest(
+                            prepped_decoded, prepped_label, fillvalue=""
+                        )
+                        if b
+                    ]
+                )
+            )
+
+        self.total += 1
+
     def compute(self):
         return self.correct / self.total
 
@@ -90,7 +104,7 @@ class EM(OurMetric):
 
 
 # class PrecisionAcc:
-#     def __init__(self): 
+#     def __init__(self):
 #         self.precision_accuracies = []
 
 #     @beartype
@@ -105,9 +119,9 @@ class EM(OurMetric):
 
 #         precision_acc_label_np =   np.array(precision_acc_label,   dtype=np.int64)
 #         precision_acc_decoded_np = np.array(precision_acc_decoded, dtype=np.int64)
-#         precision_acc =            np.mean(precision_acc_decoded_np == precision_acc_label_np) 
+#         precision_acc =            np.mean(precision_acc_decoded_np == precision_acc_label_np)
 
-#         self.precision_accuracies.append(precision_acc) 
+#         self.precision_accuracies.append(precision_acc)
 
-#     def compute(self): 
+#     def compute(self):
 #         return np.mean(self.precision_accuracies)

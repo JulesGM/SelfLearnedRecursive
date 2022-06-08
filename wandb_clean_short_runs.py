@@ -1,7 +1,9 @@
 import rich
 import wandb
 import pretty_traceback
+
 pretty_traceback.install()
+
 
 def main():
     # Get all runs
@@ -28,6 +30,7 @@ def main():
         else:
             print("No step")
         print()
+
 
 if __name__ == "__main__":
     main()

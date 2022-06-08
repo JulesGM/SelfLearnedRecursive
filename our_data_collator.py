@@ -19,12 +19,14 @@ import transformers
 import transformers.models.bart.modeling_bart as modeling_bart
 
 
-def _pad_batch_of_sequences_from_dict(features, key, pad_token_id, pad_direction) -> None:
+def _pad_batch_of_sequences_from_dict(
+    features, key, pad_token_id, pad_direction
+) -> None:
     """
     Pad a batch of sequences, with a certain key value.
 
     This is used because huggingface's PretrainedTokenizer.pad only pads input_ids.
-    
+
     Changes "features" in place in a dict.
     """
     max_length = max(len(entry[key]) for entry in features)
@@ -41,27 +43,32 @@ def _pad_batch_of_sequences_from_dict(features, key, pad_token_id, pad_direction
                 raise ValueError("pad_direction must be 'right' or 'left'")
         else:
             if pad_direction == "right":
-                features[i][key] = np.concatenate([key_entry, remainder]).astype(np.int64)
+                features[i][key] = np.concatenate([key_entry, remainder]).astype(
+                    np.int64
+                )
             elif pad_direction == "left":
-                features[i][key] = np.concatenate([remainder, key_entry]).astype(np.int64)
+                features[i][key] = np.concatenate([remainder, key_entry]).astype(
+                    np.int64
+                )
+
 
 class DataCollatorWithDecoderInputIds:
     __slots__ = (
-        "_tokenizer", 
-        "_model", 
-        "_max_length", 
+        "_tokenizer",
+        "_model",
+        "_max_length",
         "_mask_intermediate_labels",
         "_label_pad_token_id",
     )
 
     def __init__(
-        self, 
-        tokenizer: transformers.PreTrainedTokenizerBase, 
-        model: transformers.PreTrainedModel, 
+        self,
+        tokenizer: transformers.PreTrainedTokenizerBase,
+        model: transformers.PreTrainedModel,
         max_length: int,
         mask_intermediate_labels: bool,
         label_pad_token_id: int = -100,
-    ):    
+    ):
         self._tokenizer = tokenizer
         self._model = model
         self._max_length = max_length
@@ -73,7 +80,7 @@ class DataCollatorWithDecoderInputIds:
         #######################################################################
         Situation:
         - We need to pad everything.
-        - We need regular decoder input ids for training and validation. 
+        - We need regular decoder input ids for training and validation.
         - When we have a scratch pad, we need special decoder input ids to only
         predict the final value.
 
@@ -85,13 +92,15 @@ class DataCollatorWithDecoderInputIds:
         4. Build training decoder input ids by shifting labels
         5. If we have gen decoder inputs, we shift them as well.
         #######################################################################
-        
+
         """
-        assert self._tokenizer.padding_side == "left", f"Only left-padded inputs are supported. Got {self.tokenizer.padding_side}."
+        assert (
+            self._tokenizer.padding_side == "left"
+        ), f"Only left-padded inputs are supported. Got {self.tokenizer.padding_side}."
         assert self._model is not None, "You must provide a model to the data collator"
-        assert self._model.config.pad_token_id == self._tokenizer.pad_token_id, (
-            "The pad_token_id of the model must be the same as the one used by the tokenizer"
-        )
+        assert (
+            self._model.config.pad_token_id == self._tokenizer.pad_token_id
+        ), "The pad_token_id of the model must be the same as the one used by the tokenizer"
         # assert self._model.config.decoder_start_token_id == self._tokenizer.bos_token_id
         assert "decoder_attention_mask_for_gen" not in features, features.keys()
         if "decoder_input_ids" in features:
@@ -110,29 +119,29 @@ class DataCollatorWithDecoderInputIds:
         if "labels" in keys:
             _pad_batch_of_sequences_from_dict(
                 features,
-                "labels", 
+                "labels",
                 self._label_pad_token_id,
                 pad_direction=DECODER_PAD_DIRECTION,
             )
 
         #######################################################################
-        # 2. Pad gen decoder inputs if they are there       
+        # 2. Pad gen decoder inputs if they are there
         #######################################################################
         if "decoder_input_ids_for_gen" in keys:
             _pad_batch_of_sequences_from_dict(
-                features, 
+                features,
                 "decoder_input_ids_for_gen",
                 self._model.config.pad_token_id,
                 pad_direction=DECODER_PAD_DIRECTION,
-                )
+            )
 
         if "decoder_input_ids" in keys:
             _pad_batch_of_sequences_from_dict(
-                features, 
+                features,
                 "decoder_input_ids",
                 self._model.config.pad_token_id,
                 pad_direction=DECODER_PAD_DIRECTION,
-                )
+            )
 
         #######################################################################
         # 3. Pad inputs & convert everything to tensors
@@ -150,7 +159,7 @@ class DataCollatorWithDecoderInputIds:
         #######################################################################
         if "decoder_input_ids" in keys:
             assert self._mask_intermediate_labels
-            
+
             features["decoder_input_ids"] = modeling_bart.shift_tokens_right(
                 features["decoder_input_ids"],
                 self._model.config.pad_token_id,
@@ -158,14 +167,16 @@ class DataCollatorWithDecoderInputIds:
             )
 
             assert torch.all(
-                features["decoder_input_ids"][:, 0] == 
-                self._model.config.decoder_start_token_id
+                features["decoder_input_ids"][:, 0]
+                == self._model.config.decoder_start_token_id
             ), features["decoder_input_ids"][:, 0]
 
         if "labels" in features and not self._mask_intermediate_labels:
             # If we're not masking the intermediate labels, we can use the "labels"
             # field to build the `decoder_input_ids`.
-            features["decoder_input_ids"] = self._model.prepare_decoder_input_ids_from_labels(
+            features[
+                "decoder_input_ids"
+            ] = self._model.prepare_decoder_input_ids_from_labels(
                 labels=features["labels"]
             )
 
@@ -173,9 +184,11 @@ class DataCollatorWithDecoderInputIds:
             # If we're masking the intermediate labels, we can't use the "labels"
             # to build the `decoder_input_ids`, because the intermediate results are
             # masked in the label.
-            assert "decoder_input_ids_for_gen" in features or "decoder_input_ids" in features
-            
-        
+            assert (
+                "decoder_input_ids_for_gen" in features
+                or "decoder_input_ids" in features
+            )
+
         #######################################################################
         # 5. If we have gen decoder inputs, we shift them as well.
         # We remove the eos token if it's there, as we generate after it.
@@ -185,12 +198,11 @@ class DataCollatorWithDecoderInputIds:
                 features["decoder_input_ids_for_gen"],
                 self._model.config.pad_token_id,
                 self._model.config.decoder_start_token_id,
-            ) 
+            )
 
             assert torch.all(
-                features["decoder_input_ids_for_gen"][:, 0] == 
-                self._model.config.decoder_start_token_id
+                features["decoder_input_ids_for_gen"][:, 0]
+                == self._model.config.decoder_start_token_id
             ), features["decoder_input_ids_for_gen"][:, 0]
 
         return features
-

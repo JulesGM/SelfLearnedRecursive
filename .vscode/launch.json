@@ -16,7 +16,7 @@
             ],
         },
         {
-            "name": "self learned",
+            "name": "self-learned",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/main.py",
@@ -27,7 +27,7 @@
             ],
         },
         {
-            "name": "most basic",
+            "name": "basic",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/main.py",
@@ -38,7 +38,7 @@
             ],
         },
         {
-            "name": "Python: datagen.py",
+            "name": "datagen",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/datagen.py",
@@ -46,7 +46,7 @@
             "justMyCode": true
         },
         {
-            "name": "Python: Modded Bart",
+            "name": "test-bart",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/modded_bart.py",
