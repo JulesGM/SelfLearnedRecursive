@@ -1,5 +1,5 @@
 import collections
-
+import itertools
 
 
 def zip_dicts(*dicts):
@@ -39,3 +39,15 @@ def dict_unzip(list_of_dicts):
         for k in keys:
             dict_of_lists[k].append(ld[k])
     return dict_of_lists
+
+
+def concat_lists(lists):
+    [isinstance(l, list,) for l in lists]
+    return sum(lists, [])
+
+def concat_tuples(tuples):
+    [isinstance(l, tuple) for l in tuples]
+    return sum(tuples, ())
+
+def concat_iters(iters):
+    return list(itertools.chain.from_iterable(iters))

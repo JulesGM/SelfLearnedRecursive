@@ -22,7 +22,7 @@ class MostBasicDataset(torch.utils.data.Dataset):
         dataset: Dict[str, List[datagen.Node]],
         tokenizer: our_tokenizer.Tokenizer,
     ):
-        self.dataset = sum(dataset, [])
+        self.dataset = sum(dataset.values(), [])
         random.shuffle(self.dataset)
         self.tokenizer = tokenizer
 
@@ -47,7 +47,10 @@ class OracleBasicDataset(torch.utils.data.Dataset):
         dataset: Dict[str, List[datagen.Node]],
         tokenizer: our_tokenizer.Tokenizer,
     ):
-        self.dataset = sum(dataset, [])
+        self.dataset = sum(dataset.values(), [])
+        assert isinstance(self.dataset, list)
+        assert isinstance(self.dataset[0], datagen.Node)
+
         random.shuffle(self.dataset)
         self.tokenizer = tokenizer
 
@@ -55,6 +58,7 @@ class OracleBasicDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+
         encoder_input = self.dataset[idx].get_input_str()
         label, decoder_input_for_gen = self.dataset[idx].get_oracle_str()
 
@@ -74,7 +78,7 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
         dataset: Dict[str, List[datagen.Node]],
         tokenizer: our_tokenizer.Tokenizer,
     ):
-        self._dataset = sum(dataset, [])
+        self._dataset = sum(dataset.values(), [])
         random.shuffle(self._dataset)
 
         self._tokenizer = tokenizer

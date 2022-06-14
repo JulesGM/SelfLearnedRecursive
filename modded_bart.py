@@ -806,7 +806,7 @@ def main(model=None):
     )
     assert torch.allclose(new, old)
 
-    tokenizer = our_tokenizer.Tokenizer(max_length=1024, use_equal_symbol=True)
+    tokenizer = our_tokenizer.Tokenizer()
 
     config = transformers.BartConfig.from_pretrained("facebook/bart-base")
     config.no_repeat_ngram_size = 0

@@ -1,4 +1,7 @@
 print("Importing modules")
+from beartype.typing import *
+
+import collections
 import dataclasses
 import graphlib
 import itertools
@@ -11,13 +14,14 @@ import time
 
 from beartype import beartype
 import fire
+import nltk
 import numpy as np
 import pytorch_lightning as pl
 import rich
 import torch
 from tqdm import tqdm
 import transformers
-from typing import *
+
 import ujson as json
 import wandb
 
@@ -31,7 +35,6 @@ import our_datasets
 import our_metrics
 import our_tokenizer
 import modded_bart
-import concurrent_parts
 import utils
 print("Done loading modules")
 
@@ -178,14 +181,48 @@ def top_sort_build_tree(dep_dict: dict, visited_datagen: datagen.Node):
                 dep_dict[visited_datagen].append(child)
                 top_sort_build_tree(dep_dict, child)
 
+def actual_prediction(
+    batch, collator, model, generation_kwargs, gen_function
+):
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Use the Data Collator on the data
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    batch = collator(batch)
 
-def top_sort_build_tree(dep_dict: dict, visited_datagen: datagen.Node):
-    if visited_datagen.get_children():
-        dep_dict[visited_datagen] = []
-        for child in visited_datagen.get_children():
-            if child.get_children():
-                dep_dict[visited_datagen].append(child)
-                top_sort_build_tree(dep_dict, child)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Cudify everything
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    for k, v in batch.items():
+        batch[k] = v.cuda()
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Create the decoder_attention_mask
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    if "decoder_attention_mask" in batch:
+        batch["decoder_attention_mask"] = batch["decoder_attention_mask_for_gen"]
+        del batch["decoder_attention_mask_for_gen"]
+
+    bound_length = min(
+        model.config.max_length - 6, batch["decoder_input_ids_for_gen"].shape[1] - 1
+    )
+    batch["decoder_input_ids"] = batch["decoder_input_ids_for_gen"][:, :bound_length]
+    rich.print("[red bold]FIX DECODER LENGTH STUFF AND DECODER HEAD")
+    del batch["decoder_input_ids_for_gen"]
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Generate
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    start = time.perf_counter()
+    output = gen_function(
+        model=model,
+        **batch,
+        **generation_kwargs,
+    )
+
+    delta = time.perf_counter() - start
+
+    print(f"Generation took {delta:.5f} seconds, {delta / output.shape[0]}s per item.")
+    return output
 
 
 class PLBart(pl.LightningModule):
@@ -211,11 +248,13 @@ class PLBart(pl.LightningModule):
         freeform_options: Sequence[str],
         max_total_length_gen: int,
         max_answer_gen: int,
+        max_depth: int
     ):
         super().__init__()
         self.mask_intermediate_labels = isinstance(
             train_ds, our_datasets.SelfLearnedBasicDataset
         )
+        self.max_depth = max_depth
         self.max_answer_gen = max_answer_gen
         self.max_total_length_gen = max_total_length_gen
         self.shuffle_train = True
@@ -232,6 +271,9 @@ class PLBart(pl.LightningModule):
         self.freeform_options = freeform_options
 
         # Related to datasets
+        assert train_ds is not eval_ds, (
+            "train_ds and eval_ds must be different objects"
+        )
         self.train_ds = train_ds
         self.eval_ds = eval_ds
         self.num_workers_dl = num_workers_dl
@@ -354,29 +396,29 @@ class PLBart(pl.LightningModule):
         # Initialize metrics
         em = {
             mode: {
-                k: our_metrics.EM()
+                k: {"all": our_metrics.EM()} | {level: our_metrics.EM() for level in range(1, self.max_depth + 1)}
                 for k in self.freeform_options
                 if not (mode == ValidModes.per_sample and k)
-            }
+            } 
             for mode in ACTIVE_MODES
         }
-
+        
         ###################################################################
         # Examine the samples and predictions one by one.
         # In per_sample mode, also do predictions.
         ###################################################################
+
+        big_counter = []
         for i, pack in enumerate(
             tqdm(utils.zip_dicts(batch), desc="Validating", total=len(batch["input_ids"]))
         ):
+
             do_print = i < 5
 
             if do_print:
                 print("#" * 80)
 
             for is_freeform in self.freeform_options:
-                if i >= self.max_generation_quantity_valid:
-                    break
-
                 # TODO: wtf is this
                 per_batch_pred = None
                 if ValidModes.per_batch in ACTIVE_MODES:
@@ -459,26 +501,26 @@ class PLBart(pl.LightningModule):
                         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # Prep per-sample outputs
                         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                        rich.print("Raw `input_ids`:\n", sample["input_ids"])
-                        if (
-                            not is_freeform
-                            and self.eval_ds.has_decoder_input_ids_for_gen
-                        ):
-                            rich.print(
-                                "Raw `decoder_input_ids_for_gen`:\n",
-                                sample["decoder_input_ids_for_gen"],
-                            )
-                        rich.print("Raw Pred:\n", pred)
-                        rich.print("Raw `labels`:\n", sample["labels"])
+                        # rich.print("Raw `input_ids`:\n", sample["input_ids"])
+                        # if (
+                        #     not is_freeform
+                        #     and self.eval_ds.has_decoder_input_ids_for_gen
+                        # ):
+                        #     rich.print(
+                        #         "Raw `decoder_input_ids_for_gen`:\n",
+                        #         sample["decoder_input_ids_for_gen"],
+                        #     )
+                        # rich.print("Raw Pred:\n", pred)
+                        # rich.print("Raw `labels`:\n", sample["labels"])
 
-                        cleaned_inputs = clean_sample_for_logging(
+                        print_cleaned_inputs = clean_sample_for_logging(
                             sample["input_ids"], self.tokenizer
                         )
-                        cleaned_labels = clean_sample_for_logging(
+                        print_cleaned_labels = clean_sample_for_logging(
                             sample["labels"], self.tokenizer
                         )
-                        cleaned_gen = clean_sample_for_logging(pred, self.tokenizer)
-                        cleaned_decoder_input_ids = None
+                        print_cleaned_gen = clean_sample_for_logging(pred, self.tokenizer)
+                        print_cleaned_decoder_input_ids = None
 
                         if "decoder_input_ids" in generation_kwargs:
                             if mode == ValidModes.per_sample:
@@ -489,16 +531,14 @@ class PLBart(pl.LightningModule):
                                 assert (
                                     generation_kwargs["decoder_input_ids"].shape[0] == 1
                                 ), generation_kwargs["decoder_input_ids"].shape
-                                cleaned_decoder_input_ids = clean_sample_for_logging(
+                                print_cleaned_decoder_input_ids = clean_sample_for_logging(
                                     generation_kwargs["decoder_input_ids"][0],
                                     self.tokenizer,
                                 )
-                                ids = generation_kwargs["decoder_input_ids"][0]
                             elif ValidModes.per_batch:
-                                cleaned_decoder_input_ids = clean_sample_for_logging(
+                                print_cleaned_decoder_input_ids = clean_sample_for_logging(
                                     sample["decoder_input_ids_for_gen"], self.tokenizer
                                 )
-                                ids = sample["decoder_input_ids_for_gen"]
                             else:
                                 raise ValueError(f"Unknown mode {mode}")
 
@@ -506,30 +546,44 @@ class PLBart(pl.LightningModule):
                         # Print them
                         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # rich.print(f"[black bold]{mode} {'Freeform' if is_freeform else 'Not-Freeform'}:")
-                        rich.print(f'Inputs:\n[bright_cyan]"{cleaned_inputs}"')
+                        # rich.print(f'Inputs:\n[bright_cyan]"{print_cleaned_inputs}"')
 
-                        if cleaned_decoder_input_ids:
-                            rich.print(
-                                f'Decoder Inputs:\n[bright_cyan]"{cleaned_decoder_input_ids}"'
-                            )
+                        # if cleaned_decoder_input_ids:
+                        #     rich.print(
+                        #         f'Decoder Inputs:\n[bright_cyan]"{cleaned_decoder_input_ids}"'
+                        #     )
 
-                        rich.print(f'Gen:\n[bright_cyan]"{cleaned_gen}"')
-                        rich.print(f'Label:\n[bright_cyan]     "{cleaned_labels}"')
+                        # rich.print(f'Gen:\n[bright_cyan]"{print_cleaned_gen}"')
+                        # rich.print(f'Label:\n[bright_cyan]     "{print_cleaned_labels}"')
 
-                        idx_colored_a, idx_colored_b = color_matching(
-                            clean_pred, clean_label
-                        )
-                        rich.print(f"clean_pred:  ", clean_pred)
-                        rich.print(f"clean_label: ", clean_label)
-                        rich.print(f"(EM) Answer: " + ", ".join(idx_colored_a))
-                        rich.print(f"(EM) Label:  " + ", ".join(idx_colored_b))
-                        print("~" * 80)
+                        # idx_colored_a, idx_colored_b = color_matching(
+                        #     clean_pred, clean_label
+                        # )
+                        # rich.print(f"clean_pred:  ", clean_pred)
+                        # rich.print(f"clean_label: ", clean_label)
+                        # rich.print(f"(EM) Answer: " + ", ".join(idx_colored_a))
+                        # rich.print(f"(EM) Label:  " + ", ".join(idx_colored_b))
+                        # print("~" * 80)
+
 
                     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                     # Update Metrics
                     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                     if not (mode == ValidModes.per_sample and is_freeform):
-                        em[mode][is_freeform].add(
+                        # TODO: This is slow but it is precise.
+                        
+                        level = datagen.tree_depth_from_ids(sample["input_ids"], self.tokenizer)
+                        big_counter.append(level)
+
+                        assert level > 0, level
+                        assert level <= self.max_depth, level
+                        em[mode][is_freeform][level].add(
+                            clean_pred,
+                            clean_label,
+                            do_print=False,
+                            descr=None,
+                        )
+                        em[mode][is_freeform]["all"].add(
                             clean_pred,
                             clean_label,
                             do_print=False,
@@ -543,23 +597,46 @@ class PLBart(pl.LightningModule):
             for mode in ACTIVE_MODES:
                 if is_freeform and mode == ValidModes.per_sample:
                     continue
+                
+                # Make sure that the totals make sense
+                if DEBUG:
+                    sum_sub_totals = sum([
+                        level_metric.total for name, level_metric in 
+                        em[mode][is_freeform].items() if isinstance(name, int)
+                    ])
+                    assert em[mode][is_freeform]["all"].total == sum_sub_totals, (
+                        em[mode][is_freeform]["all"].total, sum_sub_totals
+                    ) 
 
-                em_obj = em[mode][is_freeform]
-
-                freeform_maybe = (
-                    "_freeform"
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Per level or all ...
+                #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                freeform_str_maybe = (
+                    "freeform_"
                     if (is_freeform and not mode == ValidModes.per_sample)
                     else ""
                 )
-                em_acc_val = em_obj.compute()
-                things_to_log[f"EM{freeform_maybe}"] = em_acc_val
-                ratio = em_obj.correct / em_obj.total
-                rich.print(
-                    f"[orange]GOT{freeform_maybe}_{mode} {em_obj.correct}/{em_obj.total} = {ratio:.2%}\n"
-                )
-
-        self.model = self.model.train()
+                for level in em[mode][is_freeform]:
+                    em_obj = em[mode][is_freeform][level]
+                    header = f"{freeform_str_maybe}{level}_{mode}"
+                    
+                    if em_obj.total:   
+                        em_acc_val = em_obj.compute()
+                        ratio = em_obj.correct / em_obj.total
+                        text_ratio = f"{em_obj.correct}/{em_obj.total}"
+                        
+                        things_to_log_key = f"EM_{header}"
+                        assert things_to_log_key not in things_to_log
+                        things_to_log[things_to_log_key] = em_acc_val
+                        rich.print(
+                            f"GOT {header} {text_ratio} = {ratio:.2%}\n"
+                        )
+                    else:
+                        rich.print(
+                            f"GOT {header} -/0 = -\n"
+                        )
         self.log_dict(things_to_log, **self.logging_conf)
+        self.model = self.model.train()
 
     def configure_optimizers(self):
         """
@@ -679,7 +756,7 @@ class PLBart(pl.LightningModule):
                         # Do the prediction
                         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # rich.print(f"[redbold]{len(without_logging_info) = } / {batch_size}")
-                        outputs = concurrent_parts.actual_prediction(
+                        outputs = actual_prediction(
                             batch_arg=without_logging_info,
                             collator=collator,
                             model=self.model,
@@ -687,7 +764,6 @@ class PLBart(pl.LightningModule):
                             gen_function=GEN_FUNCTION,
                             max_answer_gen=self.max_answer_gen,
                             max_total_gen_length=self.max_total_length_gen,
-                            tokenizer=self.tokenizer,
                         )
 
                         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -773,10 +849,9 @@ class PLBart(pl.LightningModule):
                         decoder_input_ids=decoder_input_ids,
                         labels=labels,
                     )
-                    outputs = concurrent_parts.actual_prediction(
+                    outputs = actual_prediction(
                         batch_arg=batch,
                         collator=collator,
-                        tokenizer=self.tokenizer,
                         model=self.model,
                         generation_kwargs=self.generation_kwargs,
                         gen_function=GEN_FUNCTION,
@@ -843,7 +918,7 @@ class PLBart(pl.LightningModule):
             collate_fn=our_data_collator.DataCollatorWithDecoderInputIds(
                 self.tokenizer,
                 model=self.model,
-                max_length=self.tokenizer.max_length,
+                max_length=self.model.config.max_position_embeddings,
                 mask_intermediate_labels=self.mask_intermediate_labels,
             ),
             batch_size=batch_size,
@@ -899,11 +974,20 @@ class PLBart(pl.LightningModule):
 
 
 def main(
-    freeform_options,
-    dataset_type,
-    data_name="88_3.json.pkl",    
+    freeform_options=[True, False],
+    dataset_type="oracle_basic_dataset",
+    max_level_training=3,
+    data_name="349_6_6_200000.json.pkl",    
     run_name=RUN_NAME_DEFAULT,
 ):
+
+    rich.print(
+        f"\t- {freeform_options = }\n"
+        f"\t- {dataset_type = }\n"
+        f"\t- {max_level_training = }\n"
+        f"\t- {data_name = }\n"
+        f"\t- {run_name = }"
+    )
 
     assert dataset_type in our_datasets.DATASET_TYPES, dataset_type
     assert freeform_options, freeform_options
@@ -918,20 +1002,23 @@ def main(
     EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE
     PRECISION = 16
 
-    rich.print(f"Freeform modes: {freeform_options}")
-    rich.print(
-        f"Dataset type:   [green]{our_datasets.DATASET_TYPES[dataset_type].__name__}[/]"
-    )
-
     DATA_PATH = SCRIPT_DIR / "data"
     dataset, dataset_config = datagen.load_dataset(None, DATA_PATH / data_name)
 
-    train_ds = dataset["train"]
-    valid_ds = dataset["eval"]
+    train_ds : Dict[int, datagen.Node] = dataset["train"]
+    valid_ds : Dict[int, datagen.Node] = dataset["eval"]
+    if max_level_training:
+        assert max_level_training <= dataset_config.max_depth
+        assert all(isinstance(node_name, int) for node_name in train_ds)
+        train_ds = {
+            level_no: level_nodes for level_no, level_nodes 
+            in train_ds.items() if level_no <= max_level_training
+        }
 
-    tokenizer = our_tokenizer.Tokenizer(max_length=1024, use_equal_symbol=True)
+    tokenizer = our_tokenizer.ArithmeticTokenizer()
     train_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](train_ds, tokenizer)
     valid_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](valid_ds, tokenizer)
+
 
     ###############################################################
     # Should never change
@@ -967,11 +1054,6 @@ def main(
     config.decoder_attention_heads = N_HEADS  # Default is 16
     config.encoder_ffn_dim = config.hidden_size * 4  # Default is 4096
     config.decoder_ffn_dim = config.hidden_size * 4
-
-    assert tokenizer.max_length == config.max_position_embeddings, (
-        f"max_length={tokenizer.max_length} != "
-        f"config.max_position_embeddings={config.max_position_embeddings}"
-    )
 
     # The only difference is that we take decoder_attention_masks into account
     # for positional embeddings
@@ -1013,6 +1095,7 @@ def main(
         curriculum_mode=None,
         max_generation_quantity_valid=MAX_GENERATION_QUANTITY_VALID,
         freeform_options=freeform_options,
+        max_depth=dataset_config.max_depth,
     )
 
     logger = pl.loggers.WandbLogger(

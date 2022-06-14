@@ -1,10 +1,9 @@
-from typing import *
+from beartype.typing import *
 
 import numpy as np
 import torch
 
-
-class ArithmeticTokenizer:
+class Tokenizer:
     __slots__ = (
         "vocab",
         "token_to_idx",
@@ -23,55 +22,7 @@ class ArithmeticTokenizer:
     )
 
     def __init__(self):
-        self.vocab = [
-            "<pad>",  # 0
-            "<eos>",  # 1
-            "<bos>",  # 3
-            "<start>",  # 5
-            "0",  # 6
-            "1",  # 7
-            "2",  # 8
-            "3",  # 9
-            "4",  # 10
-            "5",  # 11
-            "6",  # 12
-            "7",  # 13
-            "8",  # 14
-            "9",  # 15
-            "+",  # 16
-            "-",  # 17
-            "*",  # 18
-            "(",  # 19
-            ")",  # 20
-            "=",  # 21
-        ]
-
-        self.token_to_idx = {token: idx for idx, token in enumerate(self.vocab)}
-        self.idx_to_token = self.vocab
-        self.bos_token = "<bos>"
-        self.bos_token_id = self.token_to_idx["<bos>"]
-        self.decoder_start_token = "<start>"
-        self.decoder_start_token_id = self.token_to_idx["<start>"]
-        self.eos_token = "<eos>"
-        self.eos_token_id = self.token_to_idx["<eos>"]
-        self.pad_token = "<pad>"
-        self.pad_token_id = self.token_to_idx["<pad>"]
-        self.padding_side = "left"
-
-        self.special_tokens = {"<bos>", "<eos>", "<pad>", "<start>"}
-        self.special_token_ids = {
-            self.token_to_idx[token] for token in self.special_tokens
-        }
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Checks:
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        for token in self.vocab:
-            if token in self.special_tokens:
-                assert token[0] == "<" and token[-1] == ">", token
-            else:
-                assert "<" not in token and ">" not in token, token
-                assert len(token) == 1, token
+        raise NotImplementedError()
 
     def strip_special_tokens(self, input_text):
         for token in self.special_tokens:
@@ -203,3 +154,73 @@ class ArithmeticTokenizer:
             raise ValueError(f"Unknown return_tensors value '{return_tensors}'")
 
     __call__ = encode
+
+
+class ArithmeticTokenizer(Tokenizer):
+    __slots__ = (
+        "vocab",
+        "token_to_idx",
+        "idx_to_token",
+        "bos_token",
+        "bos_token_id",
+        "decoder_start_token",
+        "decoder_start_token_id",
+        "eos_token",
+        "eos_token_id",
+        "pad_token",
+        "pad_token_id",
+        "padding_side",
+        "special_tokens",
+        "special_token_ids",
+    )
+
+    def __init__(self):
+        self.vocab = [
+            "<pad>",  # 0
+            "<eos>",  # 1
+            "<bos>",  # 3
+            "<start>",  # 5
+            "0",  # 6
+            "1",  # 7
+            "2",  # 8
+            "3",  # 9
+            "4",  # 10
+            "5",  # 11
+            "6",  # 12
+            "7",  # 13
+            "8",  # 14
+            "9",  # 15
+            "+",  # 16
+            "-",  # 17
+            "*",  # 18
+            "(",  # 19
+            ")",  # 20
+            "=",  # 21
+        ]
+
+        self.token_to_idx = {token: idx for idx, token in enumerate(self.vocab)}
+        self.idx_to_token = self.vocab
+        self.bos_token = "<bos>"
+        self.bos_token_id = self.token_to_idx["<bos>"]
+        self.decoder_start_token = "<start>"
+        self.decoder_start_token_id = self.token_to_idx["<start>"]
+        self.eos_token = "<eos>"
+        self.eos_token_id = self.token_to_idx["<eos>"]
+        self.pad_token = "<pad>"
+        self.pad_token_id = self.token_to_idx["<pad>"]
+        self.padding_side = "left"
+
+        self.special_tokens = {"<bos>", "<eos>", "<pad>", "<start>"}
+        self.special_token_ids = {
+            self.token_to_idx[token] for token in self.special_tokens
+        }
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Checks:
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        for token in self.vocab:
+            if token in self.special_tokens:
+                assert token[0] == "<" and token[-1] == ">", token
+            else:
+                assert "<" not in token and ">" not in token, token
+                assert len(token) == 1, token

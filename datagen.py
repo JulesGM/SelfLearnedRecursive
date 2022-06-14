@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
+from beartype.typing import *
+
 import collections
 import copy
 import concurrent.futures as futures
@@ -10,24 +12,25 @@ import math
 from pathlib import Path
 import pickle
 import time
-from typing import *
+
 
 from beartype import beartype
 import pretty_traceback
 
 pretty_traceback.install()
+import fire
+import nltk
 import numpy as np
 import random
 import rich
 from tqdm import tqdm
-from typing import *
-import ujson as json
+import orjson as json
 
 import utils
 import our_tokenizer
 
 LOGGER = logging.getLogger(__name__)
-
+DEBUG = True
 SCRIPT_DIR = Path(__file__).absolute().parent
 
 opmap = {
@@ -35,6 +38,27 @@ opmap = {
     "*": lambda x, y: str(int(x) * int(y)),
     "-": lambda x, y: str(int(x) - int(y)),
 }
+
+
+def tree_depth_from_str(tree_string: str) -> int:
+    assert isinstance(tree_string, str)
+    bool_test = np.fromiter((char == "(" for char in tree_string if char in ["(", ")"]), np.int64)
+    cum_sum = np.cumsum(2 * bool_test - 1)
+    assert cum_sum[-1] == 0
+    val = np.max(cum_sum)
+    
+    nltk_val = nltk.Tree.fromstring(tree_string).height() - 1
+    assert val == nltk_val, (val, nltk_val)
+    return val
+
+
+def tree_depth_from_ids(ids: List[int], tokenizer) -> int:
+    return tree_depth_from_str(tokenizer.decode(ids, False).split(tokenizer.eos_token, 1)[0])
+
+
+def tree_depth_from_ids_batch(ids: List[int], tokenizer) -> List[int]:
+    decoded_and_cleaned = [tokenizer.decode(x, False).split(tokenizer.eos_token, 1)[0] for x in ids]
+    return [tree_depth_from_str(x) for x in decoded_and_cleaned]
 
 def get_all_desc(root: "Node") -> Generator["Node", None, None]:
     work_stack = [root]
@@ -51,20 +75,27 @@ def multiple_get_all_desc(iterable: Iterable["Node"]) -> Generator["Node", None,
         yield from get_all_desc(node)
 
 
-def nodes_and_desc_have_complexity_levels(nodes: Iterable["Node"]) -> bool:
-    for node in multiple_get_all_desc(nodes):
+def all_nodes_have_complexity_levels(all_nodes: "Node") -> bool:
+    for node in all_nodes:
         if node.get_complexity_level() is None:
             return False
     return True
     
 
-def nodes_and_desc_have_unique_ids(lst: Iterable["Node"]) -> bool:
+def all_nodes_have_unique_ids(all_nodes: "Node") -> bool:
     seen = set()
-    for node in multiple_get_all_desc(lst):
+    for node in all_nodes:
         if id(node) in seen:
             return False
         seen.add(id(node))
     return True
+
+def all_nodes_have_root_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
+    for node in all_nodes:
+        if node.get_root_complexity_level() is None:
+            return False
+    return True
+
 
 @beartype
 def prep_input_data(
@@ -82,11 +113,11 @@ def load_dataset(json_path: str, pkl_path: str) -> Tuple[Dict[str, Dict[int, "No
 
     rich.print("[blue]Loading data file.")
     if pkl_path:
-        rich.print(f"[blue]Loading data file {pkl_path}")
+        rich.print(f"[blue]Loading PKL data file \"{pkl_path}\"")
         with open(pkl_path, "rb") as f:
             dicts = pickle.load(f)
     else:
-        rich.print(f"[blue]Loading data file {json_path}")
+        rich.print(f"[blue]Loading JSON data file \"{json_path}\"")
         assert json_path
         with open(json_path, "r") as f:
             dicts = json.load(f)
@@ -96,41 +127,28 @@ def load_dataset(json_path: str, pkl_path: str) -> Tuple[Dict[str, Dict[int, "No
     config = dicts["config"]
     data = dicts["data"]
     
-    assert isinstance(data, list)
-    num_levels = len(data)
-    assert isinstance(data[0], dict)
-    assert isinstance(data[0]["train"], list)
-    assert isinstance(data[0]["train"][0], dict)
-    assert isinstance(data[0]["eval"], list)
-    assert isinstance(data[0]["eval"][0], dict)
-    assert "op" in data[0]["train"][0]
-    assert "op" in data[0]["eval"][0]
-
-    print("Inverting dict")
-    per_split = utils.dict_unzip(data)
-    print("Dict inverted")
-
-    # Cheap sanity checks
-    assert isinstance(per_split, dict)
-    assert "train" in per_split
-    assert "eval" in per_split
-    assert isinstance(per_split["train"], list)
-    assert isinstance(per_split["eval"], list)
-    assert len(per_split["train"]) == num_levels
-    assert len(per_split["eval"]) == num_levels
-    assert "op" in per_split["train"][0][0]
-    assert "op" in per_split["eval"][0][0]
+    assert isinstance(data, dict)
+    assert set(data.keys()) == {"train", "eval"}, data.keys()
+    for split in data.values():
+        print(split.keys())
+        assert isinstance(split, dict)
+        assert isinstance(split[1], list)
+        assert isinstance(split[1][0], dict)
+        assert "op" in split[1][0]
 
     print("Building nodes")
-    for split, split_data in per_split.items():
-        for level_idx, level_list in enumerate(tqdm(split_data, desc=f"Building nodes for {split}")):
-            for node_idx, node_dict in enumerate(level_list):
-                per_split[split][level_idx][node_idx] = Node.from_json_dict(
-                    node_dict
+    output = collections.defaultdict(lambda: collections.defaultdict(list))
+    for split, split_data in data.items():
+        for level_idx, level_list in tqdm(split_data.items(), desc=f"Building nodes for {split}"):
+            for node_dict in tqdm(level_list, desc=f"building level {level_idx} nodes"):
+                output[split][level_idx].append(
+                    Node.from_json_dict(
+                        node_dict
+                    )
                 )
 
     LOGGER.debug(f"Done loading dataset.")
-    return per_split, NestedClacConfig.from_json_dict(config)
+    return output, NestedClacConfig.from_json_dict(config)
 
 
 class Node:
@@ -566,24 +584,20 @@ def filter_length(
     complete_str = root.get_oracle_str()[0]
     complete_tokens = tokenizer(complete_str, None, no_eos=True)
 
-    if len(complete_tokens) > max_len_total:
+    # Check complete length
+    if max_len_total is not None and len(complete_tokens) > max_len_total:
         return False
 
-    work_stack = [root]
-    while work_stack:
-        node = work_stack.pop()
+    # Check answer length
+    if max_len_answer is None:
+        return True
 
-        # Process current node
+    for node in get_all_desc(root):
         answer = node.get_value()
         answer_tokens = tokenizer(answer, None, no_eos=True)
         if len(answer_tokens) > max_len_answer:
             return False
-
-        # Process children
-        maybe_children = node.get_children()
-        if maybe_children:
-            work_stack.extend(maybe_children)
-
+    
     return True
 
 
@@ -591,7 +605,7 @@ def set_childrens_root_complexity_level(root: Node) -> None:
     assert root.get_complexity_level()
     root_complexity_level = root.get_complexity_level()
     for node in get_all_desc(root):
-        node.set_complexity_level(root_complexity_level)
+        node.set_root_complexity_level(root_complexity_level)
 
 
 class FilterLengthFunctor:
@@ -614,75 +628,15 @@ def zeroth_level(config):
     # Zeroth level nodes are a special case because they're the same
     # for both sets. (& don't have subnodes)
     ###########################################################################
-    return [
+    train = [
         Node(op=None, children=None, value=value, complexity_level=0,)
         for value in range(10 ** config.max_digits)
     ]
-
-def first_level(zeroth_l):
-    ###########################################################################
-    # Level 1 nodes.
-    # Level one nodes are a special case because both the train and the eval
-    # sets are the same, and because the eval and the train set of the zeroth
-    # level are as well.
-    ###########################################################################
-    first_all: List[Node] = []
-    # We want all the entries of level 1
-    for op in config.operators:
-        for a in zeroth_l:
-            for b in zeroth_l:
-                # The nodes will be told their depth as an optimization of the
-                # sorting procedures, so they need to be distinct.
-                sub_node_a = copy.deepcopy(a)
-                sub_node_b = copy.deepcopy(b)
-                first_all.append(
-                    Node(
-                        op=op,
-                        children=[sub_node_a, sub_node_b],
-                        value=opmap[op](a.get_value(), b.get_value()),
-                        complexity_level=1,
-                    )
-                )
-
-    # There are way too few level 1 equations, we use them on both
-    # validation splits. (There are just 300 total).
-    # We may want to oversample these, too.
-    #
-    # This is the only level where we copy the nodes. We can't just reuse
-    # the same ones, because we have a bunch of checks to make sure no
-    # node is used twice, that are useful in general. So we deep copy the nodes.
-    first_l = dict(train=first_all, eval=copy.deepcopy(first_all))
-    return first_l, first_all
-
-def second_level(config, zeroth_l, first_all, filter_length_lambda):
-    ###########################################################################
-    # Level 2 nodes.
-    # Level 2 is a special case because level 1 nodes are identical, so we
-    # can't just call generate on the two sets of level 1 nodes.
-    ###########################################################################
-    # Here we generate from all the level 1 equations, because both sets 
-    # are the same.
+    eval = copy.deepcopy(train)
+    return dict(train=train, eval=eval)
     
-    all_second_l = list(
-        generate(
-            config=config,
-            previous=first_all,
-            all_previous=first_all + zeroth_l,
-            qty_required="all",
-            complexity_level=2,
-            name="ALL SECONDS",
-            filter_lambda=filter_length_lambda,
-        )
-    )
 
-    random.shuffle(all_second_l)
-    second_l = dict(
-        train=all_second_l[:len(all_second_l) // 2][:config.qty_second_layer],
-        eval=all_second_l [len(all_second_l) // 2:][:config.qty_second_layer],
-    )
-    return second_l
-
-def third_level_and_more(qty, complexity_level, split_previous, all_split_previous, filter_length_lambda):
+def first_level_and_more(config, qty, complexity_level, split_previous, all_split_previous, filter_length_lambda):
     ###########################################################################
     # Level 3 nodes.
     # Level 3 nodes are the first nodes where it isn't a special case in any
@@ -696,7 +650,7 @@ def third_level_and_more(qty, complexity_level, split_previous, all_split_previo
                 config=config,
                 previous=split_previous_roots,
                 all_previous=all_split_previous[split_name],
-                qty_required=int(qty * 1.25),
+                qty_required="all" if complexity_level <= 2 else int(qty * 1.25),
                 complexity_level=complexity_level,
                 filter_lambda=filter_length_lambda,
                 name=f"{split_name} {complexity_level}",
@@ -712,65 +666,77 @@ def third_level_and_more(qty, complexity_level, split_previous, all_split_previo
 def generate_data(
     config: "NestedClacConfig",
 ) -> Tuple[List[Node], List[Node], List[Node]]:
-    tokenizer = our_tokenizer.Tokenizer(512, True)
+    tokenizer = our_tokenizer.ArithmeticTokenizer()
     filter_length_lambda = FilterLengthFunctor(
         config.max_answer_length, config.max_total_length, tokenizer
     )
 
     zeroth_l = zeroth_level(config)
-    first_l, first_all = first_level(zeroth_l) 
-    second_l = second_level(
-        config=config, 
-        zeroth_l=zeroth_l, 
-        first_all=first_all, 
-        filter_length_lambda=filter_length_lambda)
-    n_th = [zeroth_l, first_l, second_l]
-    del zeroth_l
-    del first_l
-    del first_all
-    del second_l
-
-    for level in range(3, config.max_depth + 1):
-        new = third_level_and_more(
-            config.qty_third_layer, level, n_th[-1], dict(
-                train=sum((level_["train"] for level_ in n_th[1:]), []) + n_th[0],
-                eval=sum((level_["eval"] for level_ in n_th[1:]), []) + n_th[0],
-            ), filter_length_lambda
+    
+    per_set = {split: {0: zeroth_l[split]} for split in ["train", "eval"]}
+    for level in range(1, config.max_depth + 1):
+        new = first_level_and_more(
+            config=config,
+            qty=config.max_qty_per_level, 
+            complexity_level=level, 
+            split_previous={split: per_set[split][level - 1] for split in ["train", "eval"]}, 
+            all_split_previous={split: utils.concat_lists(per_set[split].values()) for split in ["train", "eval"]},  
+            filter_length_lambda=filter_length_lambda
         )
-        n_th.append(new)
 
+        for split, nodes in new.items():
+            per_set[split][level] = nodes
+    
+    # We don't save zeroth level nodes. There's nothing to learn from them.
+    for per_level in per_set.values():
+        del per_level[0]
 
     ###########################################################################
     # Fix the lengths of the second layer.
     # Needs to be done after level 3 because we don't want to needlessly
-    # throw away level two equations that could be used in level 3.
+    # throw away equations that could be used in level 3.
     ###########################################################################
-    for k in n_th[2]:
-        n_th[2][k] = n_th[2][k][: config.qty_second_layer]
+    for k in per_set:
+        per_set[k][2] = per_set[k][2][: config.max_qty_per_level]
 
     ################################################################################
     # Make some checks on all root nodes, fix root_level_complexity
     ################################################################################
-    all_root_nodes: List[Node] = []
-    for nodes_splits in n_th[1:]:
-        for nodes in nodes_splits.values():
-            all_root_nodes.extend(nodes)
+    print("Building a list of all nodes.")
+    all_root_nodes = utils.concat_lists(
+        utils.concat_lists(
+            [[v for v in tqdm(x.values())] for x in tqdm(per_set.values())]
+        )
+    )
+    all_nodes = list(multiple_get_all_desc(all_root_nodes))
 
-    assert len(set(all_root_nodes)) == len(all_root_nodes), "Duplicate nodes"
-    assert nodes_and_desc_have_unique_ids(all_root_nodes)
-    assert nodes_and_desc_have_complexity_levels(all_root_nodes)
+    if DEBUG:
+        print("Doing some checks.")
+        assert len(set(all_nodes)) == len(all_nodes), "Duplicate nodes"
+        assert all_nodes_have_unique_ids(all_nodes)
+        assert all_nodes_have_complexity_levels(all_nodes)
 
-    for top_level_node in all_root_nodes:
+    print("Setting root_level_complexity.")
+    for top_level_node in tqdm(all_root_nodes):
         set_childrens_root_complexity_level(top_level_node)      
+
+    if DEBUG:
+        print("Final check")
+        assert all_nodes_have_root_complexity_levels(all_nodes)
 
     ################################################################################
     # Print the lengths
     ################################################################################
-    lengths = {i: {k: len(v) for k, v in n_th[i].items()} for i in range(1, len(n_th))}
     print("Final lengths:")
-    rich.print(lengths)
+    lengths = {}
+    for cv_set_name, cv_set_per_level in tqdm(per_set.items()):
+        lengths[cv_set_name] = {
+            level_idx: len(level_nodes) for 
+            level_idx, level_nodes in cv_set_per_level.items()
+        }
 
-    return n_th
+    rich.print(lengths)
+    return per_set
 
 
 class PredLogger:
@@ -807,18 +773,21 @@ class NestedClacConfig:
         max_answer_length: int,
     ):
         self.max_depth = max_depth
+
+        assert max_total_length
+        assert max_total_length <= 1024, (
+            "This is the length of the whole context of BART, it's the hardest limit."
+        )
         self.max_total_length = max_total_length
 
         self.seed: int = 1337
         # dataset
         self.operators = {"+", "*", "-"}
         self.max_digits = 1
-        self.qty_second_layer = 200000
-        self.qty_third_layer = 200000
+        self.max_qty_per_level = 10000
         self.max_answer_length = max_answer_length
         
-        assert self.max_depth >= 3
-        self.output_name = f"{self.max_total_length}_{self.max_answer_length}_{self.max_depth}.json"
+        self.output_name = f"{self.max_total_length}_{self.max_answer_length}_{self.max_depth}_{self.max_qty_per_level}.json"
         
 
     def to_json_dict(self):
@@ -848,21 +817,27 @@ class NestedClacConfig:
         return obj
 
 
-if __name__ == "__main__":
+def main():
     # create basic config for logging
     logging.basicConfig(level=logging.DEBUG)
-
-    config = NestedClacConfig(max_depth=8, max_total_length=None, max_answer_length=None)
-    n_th = generate_data(config)
     
-    dataset = dict(
-        data=[{
-            split: [sample.to_json_dict() for sample in tqdm(samples)]
-            for split, samples in entry.items()
-        } for entry in n_th[1:]],
-        config=config.to_json_dict(),
-    )
+    config = NestedClacConfig(max_depth=6, max_total_length=349, max_answer_length=6)
+    per_set = generate_data(config)
+    
+    print("Building the dict object that will be saved.")
+    dataset = {"data": {}, "config": config.to_json_dict()}
+    data = dataset["data"]
+    for split, nodes_per_level in per_set.items():
+        data[split] = {}
+        split_dict = data[split]
+        for level_name, nodes_per_level in nodes_per_level.items():
+            assert level_name != 0, level_name
+            split_dict[level_name] = [
+                sample.to_json_dict() for sample in tqdm(nodes_per_level, desc=f"Split {split} Level {level_name}")
+            ]
+    
 
+    print("Saving the data.")
     start = time.perf_counter()
     with open(SCRIPT_DIR / "data" / f"{config.output_name}.pkl", "bw") as f:
         pickle.dump(dataset, f)
@@ -870,5 +845,8 @@ if __name__ == "__main__":
 
     start = time.perf_counter()
     with open(SCRIPT_DIR / "data" / config.output_name, "w") as f:
-        json.dump(dataset, f, indent=4)
+        f.write(json.dumps(dataset, indent=4))
     print(f"Dumped json in {time.perf_counter() - start:0.2f} seconds")
+
+if __name__ == "__main__":
+    main()
