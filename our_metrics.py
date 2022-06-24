@@ -25,7 +25,7 @@ class OurMetric(abc.ABC):
         return dict(cleaned_preds=cleaned_preds, cleaned_labels=cleaned_labels)
 
     @abc.abstractmethod
-    def add(self, *args, **kwargs):
+    def add(self, pred: list, label: list, do_print=False, descr=""):
         raise RuntimeError("Shouldn't be run directly")
 
     @abc.abstractmethod

@@ -31,17 +31,64 @@ import math
 import random
 from typing import *
 
+import pretty_traceback
+pretty_traceback.install()
 import rich
 import torch
 from torch import nn
 import transformers.models.bart.modeling_bart as original
 
-import pretty_traceback
+import bart_rel_att
 
-pretty_traceback.install()
 
 
 logger = logging.getLogger(__name__)
+
+
+@torch.jit.script
+def _compute_abs_position_ids(
+    position_ids: Optional[torch.Tensor], past_key_values_length: int, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    # In order to work with cache (which is when past_key_values_length is not None), we need to
+    # have position_ids given to us because we can't compute them.
+    if past_key_values_length != 0:
+        assert position_ids is not None
+
+    # If we don't have position_ids, we need to compute them
+    if position_ids is None:
+        assert past_key_values_length == 0, past_key_values_length
+        position_ids = attention_mask.cumsum(dim=-1) - 1
+        position_ids.masked_fill_(position_ids < 0, 0)  # Prevent negative positions
+    
+    return position_ids
+
+
+class FixedPositionalEmbedding(nn.Module):
+    """From TransformerXL
+    https://github.com/kimiyoung/transformer-xl/blob/master/pytorch/mem_transformer.py#L15
+    """
+    def __init__(self, demb):
+        super().__init__()
+        rich.print("[blue]BUILT FIXED POS EMBS")
+        self.demb = demb
+        inv_freq = 1 / (10000 ** (torch.arange(0., demb, 2.) / demb))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(
+        self, 
+        *,
+        past_key_values_length: int, 
+        attention_mask: torch.Tensor, 
+        position_ids: Optional[torch.LongTensor], 
+    ):
+        assert attention_mask is not None
+        
+        position_ids = _compute_abs_position_ids(position_ids, past_key_values_length, attention_mask)
+
+        sinusoid_inp = torch.einsum("bi,bj->bij", position_ids, self.inv_freq.reshape(1, -1))  # torch.ger(position_ids, self.inv_freq)
+        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
+
+        return pos_emb
 
 
 class ModifiedBartLearnedPositionalEmbedding(nn.Embedding):
@@ -58,12 +105,9 @@ class ModifiedBartLearnedPositionalEmbedding(nn.Embedding):
     def forward(
         self,
         *,
-        input_ids_shape: torch.Size,
         past_key_values_length: int,
         attention_mask: torch.Tensor,
-        input_ids: torch.Tensor,
-        padding_idx: int,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor],
     ) -> torch.Tensor:
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
 
@@ -73,16 +117,7 @@ class ModifiedBartLearnedPositionalEmbedding(nn.Embedding):
         # We should always have an attention mask at this point.
         assert attention_mask is not None
 
-        # In order to work with cache (which is when past_key_values_length is not None), we need to
-        # have position_ids given to us because we can't compute them.
-        if past_key_values_length != 0:
-            assert position_ids is not None
-
-        # If we don't have position_ids, we need to compute them
-        if position_ids is None:
-            assert past_key_values_length == 0, past_key_values_length
-            position_ids = attention_mask.cumsum(dim=-1) - 1
-            position_ids.masked_fill_(position_ids < 0, 0)  # Prevent negative positions
+        position_ids = _compute_abs_position_ids(position_ids, past_key_values_length, attention_mask)
 
         # If we already had position_ids, they would also be use here.
         output = super().forward(position_ids + self.offset)
@@ -105,6 +140,243 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.bool(), float("-inf"))
 
 
+class ModifiedBartEncoder(original.BartPretrainedModel):
+    """
+    Transformer encoder consisting of *config.encoder_layers* self attention layers. Each layer is a
+    [`BartEncoderLayer`].
+
+    Args:
+        config: BartConfig
+        embed_tokens (nn.Embedding): output embedding
+    """
+
+    def __init__(
+        self, 
+        *,
+        config: original.BartConfig, 
+        use_fixed_pos_embs: bool,
+        use_rel_pos_embs: int,
+        num_rel_pos_embs: int,
+        embed_tokens: Optional[nn.Embedding] = None,
+    ):
+        super().__init__(config)
+
+        self.dropout = config.dropout
+        self.layerdrop = config.encoder_layerdrop
+
+        embed_dim = config.d_model
+        self.padding_idx = config.pad_token_id
+        self.max_source_positions = config.max_position_embeddings
+        self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
+        self.use_fixed_pos_embs = use_fixed_pos_embs
+        self.use_rel_pos_embs = use_rel_pos_embs
+        self.num_rel_pos_embs = num_rel_pos_embs
+
+        if embed_tokens is not None:
+            self.embed_tokens = embed_tokens
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, embed_dim, self.padding_idx)
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Name changed.
+        #     Added fixed positional embeddings.
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        assert use_fixed_pos_embs
+        if use_fixed_pos_embs:
+            self.embed_positions = FixedPositionalEmbedding(
+                config.d_model,
+            )
+
+        else:
+            self.embed_positions = ModifiedBartLearnedPositionalEmbedding(
+                config.max_position_embeddings,
+                config.d_model,
+            )
+
+        if use_rel_pos_embs:
+            self.layers = nn.ModuleList(
+                [bart_rel_att.RelAttBartEncoderLayer(config) for _ in range(config.encoder_layers)]
+            )
+            self.rel_pos_embs = bart_rel_att.RelPosEmbs(
+                model_d=config.d_model, 
+                mode=use_rel_pos_embs,
+                num_embeddings=num_rel_pos_embs
+            )
+
+        else:
+            self.layers = nn.ModuleList(
+                [original.BartEncoderLayer(config) for _ in range(config.encoder_layers)]
+            )
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        self.layernorm_embedding = nn.LayerNorm(embed_dim)
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        head_mask=None,
+        inputs_embeds=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        r"""
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
+                provide it.
+
+                Indices can be obtained using [`BartTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+                [`PreTrainedTokenizer.__call__`] for details.
+
+                [What are input IDs?](../glossary#input-ids)
+            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+
+                - 1 for tokens that are **not masked**,
+                - 0 for tokens that are **masked**.
+
+                [What are attention masks?](../glossary#attention-mask)
+            head_mask (`torch.Tensor` of shape `(encoder_layers, encoder_attention_heads)`, *optional*):
+                Mask to nullify selected heads of the attention modules. Mask values selected in `[0, 1]`:
+
+                - 1 indicates the head is **not masked**,
+                - 0 indicates the head is **masked**.
+
+            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
+                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation.
+                This is useful if you want more control over how to convert `input_ids` indices into associated vectors
+                than the model's internal embedding lookup matrix.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            output_hidden_states (`bool`, *optional*):
+                Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
+                for more detail.
+            return_dict (`bool`, *optional*):
+                Whether or not to return a [`~file_utils.ModelOutput`] instead of a plain tuple.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # retrieve input_ids and inputs_embeds
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+            input_ids = input_ids.view(-1, input_shape[-1])
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        embed_pos = self.embed_positions(
+            past_key_values_length=0, # No past
+            attention_mask=attention_mask,
+            position_ids=None, # No previous pos ids
+        )
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Modified by us
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if self.use_rel_pos_embs:
+            rel_att_keys, rel_att_values = self.rel_pos_embs(
+                attention_mask=attention_mask,
+            )
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+        hidden_states = inputs_embeds + embed_pos
+        hidden_states = self.layernorm_embedding(hidden_states)
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+        # expand attention_mask
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            attention_mask = _expand_mask(attention_mask, inputs_embeds.dtype)
+
+        encoder_states = () if output_hidden_states else None
+        all_attentions = () if output_attentions else None
+
+        # check if head_mask has a correct number of layers specified if desired
+        if head_mask is not None:
+            if head_mask.size()[0] != (len(self.layers)):
+                raise ValueError(
+                    f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
+                )
+
+        for idx, encoder_layer in enumerate(self.layers):
+            if output_hidden_states:
+                encoder_states = encoder_states + (hidden_states,)
+            # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            dropout_probability = random.uniform(0, 1)
+            if self.training and (dropout_probability < self.layerdrop):  # skip the layer
+                layer_outputs = (None, None)
+            else:
+                if self.gradient_checkpointing and self.training:
+                    assert False, "Gradient checkpointing is not supported with rel pos embs"
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs, output_attentions)
+
+                        return custom_forward
+
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(encoder_layer),
+                        hidden_states,
+                        attention_mask,
+                        (head_mask[idx] if head_mask is not None else None),
+                    )
+                else:
+                    encoder_layer_args = dict(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                        output_attentions=output_attentions,
+                    )
+
+                    if self.use_rel_pos_embs:
+                        encoder_layer_args["rel_att_keys"] = rel_att_keys
+                        encoder_layer_args["rel_att_values"] = rel_att_values
+                
+                    layer_outputs = encoder_layer(
+                        **encoder_layer_args
+                    )
+
+                hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_attentions = all_attentions + (layer_outputs[1],)
+
+        if output_hidden_states:
+            encoder_states = encoder_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
+        return original.BaseModelOutput(
+            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
+        )
+
+
+
 class ModifiedBartDecoder(original.BartDecoder):
     """
 
@@ -115,7 +387,13 @@ class ModifiedBartDecoder(original.BartDecoder):
     """
 
     def __init__(
-        self, config: original.BartConfig, embed_tokens: Optional[nn.Embedding] = None
+        self, 
+        *,
+        config: original.BartConfig, 
+        use_fixed_pos_embs: bool,
+        use_rel_pos_embs: Union[int, bool],
+        num_rel_pos_embs: int,
+        embed_tokens: Optional[nn.Embedding],
     ):
         original.BartPretrainedModel.__init__(self, config)
 
@@ -124,6 +402,8 @@ class ModifiedBartDecoder(original.BartDecoder):
         self.padding_idx = config.pad_token_id
         self.max_target_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
+        self.use_rel_pos_embs = use_rel_pos_embs
+        self.num_rel_pos_embs = num_rel_pos_embs
 
         if embed_tokens is not None:
             self.embed_tokens = embed_tokens
@@ -133,16 +413,36 @@ class ModifiedBartDecoder(original.BartDecoder):
             )
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Name changed
+        # Name changed.
+        #     Added fixed positional embeddings.
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        self.embed_positions = ModifiedBartLearnedPositionalEmbedding(
-            config.max_position_embeddings,
-            config.d_model,
-        )
+        if use_fixed_pos_embs:
+            self.embed_positions = FixedPositionalEmbedding(
+                config.d_model,
+            )
+
+        else:
+            self.embed_positions = ModifiedBartLearnedPositionalEmbedding(
+                config.max_position_embeddings,
+                config.d_model,
+            )
+
+        if use_rel_pos_embs:
+            self.layers = nn.ModuleList(
+                [bart_rel_att.RelAttBartDecoderLayer(config) for _ in range(config.decoder_layers)]
+            )
+            self.rel_pos_embs = bart_rel_att.RelPosEmbs(
+                model_d=config.d_model, 
+                mode=use_rel_pos_embs,
+                num_embeddings=num_rel_pos_embs
+            )
+
+        else:
+            self.layers = nn.ModuleList(
+                [original.BartDecoderLayer(config) for _ in range(config.decoder_layers)]
+            )
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        self.layers = nn.ModuleList(
-            [original.BartDecoderLayer(config) for _ in range(config.decoder_layers)]
-        )
+
         self.layernorm_embedding = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
@@ -318,6 +618,7 @@ class ModifiedBartDecoder(original.BartDecoder):
 
         un_prepared_attention_mask = attention_mask
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, input_shape, inputs_embeds, past_key_values_length
         )
@@ -333,11 +634,8 @@ class ModifiedBartDecoder(original.BartDecoder):
         # Modified by us
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         positions = self.embed_positions(
-            input_ids_shape=input_shape,
             past_key_values_length=past_key_values_length,
             attention_mask=un_prepared_attention_mask,
-            input_ids=input_ids,
-            padding_idx=self.padding_idx,
             position_ids=decoder_position_ids,
         )
 
@@ -369,6 +667,16 @@ class ModifiedBartDecoder(original.BartDecoder):
                         f"The `{mask_name}` should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
                     )
 
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Modified by us
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if self.use_rel_pos_embs:
+            rel_att_keys, rel_att_values = self.rel_pos_embs(
+                attention_mask=un_prepared_attention_mask,
+            )
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
         for idx, decoder_layer in enumerate(self.layers):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
@@ -382,6 +690,7 @@ class ModifiedBartDecoder(original.BartDecoder):
             )
 
             if self.gradient_checkpointing and self.training:
+                assert False, "rel pos embs are not supported for gradient checkpointing"
 
                 if use_cache:
                     logger.warning(
@@ -409,9 +718,11 @@ class ModifiedBartDecoder(original.BartDecoder):
                     None,
                 )
             else:
-
-                layer_outputs = decoder_layer(
-                    hidden_states,
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Added relative pos embs
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                decoder_layer_args = dict(
+                    hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
@@ -425,6 +736,16 @@ class ModifiedBartDecoder(original.BartDecoder):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
+
+                if self.use_rel_pos_embs:
+                    decoder_layer_args["rel_att_keys"] = rel_att_keys
+                    decoder_layer_args["rel_att_values"] = rel_att_values
+                
+                layer_outputs = decoder_layer(
+                    **decoder_layer_args    
+                )
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
             hidden_states = layer_outputs[0]
 
             if use_cache:
@@ -462,19 +783,38 @@ class ModifiedBartDecoder(original.BartDecoder):
         )
 
 
+
 class ModifiedBartModel(original.BartModel):
     """
     Only modified to use `ModifiedBartDecoder` instead of `BartDecoder`.
     """
 
-    def __init__(self, config: original.BartConfig):
+    def __init__(
+        self, 
+        config: original.BartConfig, 
+        use_fixed_pos_embs: bool,
+        use_rel_pos_embs: int,
+        num_rel_pos_embs: int,
+    ):
         original.BartPretrainedModel.__init__(self, config)
 
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
 
-        self.encoder = original.BartEncoder(config, self.shared)
-        self.decoder = ModifiedBartDecoder(config, self.shared)
+        self.encoder = ModifiedBartEncoder(
+            config=config, 
+            use_fixed_pos_embs=use_fixed_pos_embs, 
+            use_rel_pos_embs=use_rel_pos_embs, 
+            num_rel_pos_embs=num_rel_pos_embs,
+            embed_tokens=self.shared,
+        )
+        self.decoder = ModifiedBartDecoder(
+            config=config, 
+            use_fixed_pos_embs=use_fixed_pos_embs, 
+            use_rel_pos_embs=use_rel_pos_embs,
+            num_rel_pos_embs=num_rel_pos_embs,
+            embed_tokens=self.shared,
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -543,6 +883,7 @@ class ModifiedBartModel(original.BartModel):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+
         # If the user passed a tuple for encoder_outputs, we wrap it in a BaseModelOutput when return_dict=True
         elif return_dict and not isinstance(encoder_outputs, original.BaseModelOutput):
             encoder_outputs = original.BaseModelOutput(
@@ -588,9 +929,20 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
     Only modified to use `ModifiedBartModel` instead of `BartModel`.
     """
 
-    def __init__(self, config: original.BartConfig):
+    def __init__(
+        self, 
+        config: original.BartConfig, 
+        use_fixed_pos_embs: bool, 
+        use_rel_pos_embs: Union[int, bool], 
+        num_rel_pos_embs: int
+    ):
         original.BartPretrainedModel.__init__(self, config)
-        self.model = ModifiedBartModel(config)
+        self.model = ModifiedBartModel(
+            config, 
+            use_fixed_pos_embs=use_fixed_pos_embs,
+            use_rel_pos_embs=use_rel_pos_embs,
+            num_rel_pos_embs=num_rel_pos_embs,
+        )
         self.register_buffer(
             "final_logits_bias", torch.zeros((1, self.model.shared.num_embeddings))
         )
@@ -784,7 +1136,6 @@ def main(model=None):
     seq_len = 128
     depth = 10
     bsz = 3
-    padding_idx = 0
 
     modified_layer = ModifiedBartLearnedPositionalEmbedding(maxlen, depth)
     original_layer = original.BartLearnedPositionalEmbedding(maxlen, depth)
@@ -793,11 +1144,8 @@ def main(model=None):
     input_ids = torch.ones((bsz, seq_len), dtype=torch.long)
 
     new = modified_layer(
-        input_ids_shape=input_ids.shape,
         past_key_values_length=0,
         attention_mask=fake_attention_mask,
-        input_ids=input_ids,
-        padding_idx=padding_idx,
         position_ids=None,
     )
     old = original_layer(

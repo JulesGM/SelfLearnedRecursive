@@ -42,30 +42,37 @@ opmap = {
 
 def tree_depth_from_str(tree_string: str) -> int:
     assert isinstance(tree_string, str)
-    bool_test = np.fromiter((char == "(" for char in tree_string if char in ["(", ")"]), np.int64)
+    bool_test = np.fromiter(
+        (char == "(" for char in tree_string if char in ["(", ")"]), np.int64
+    )
     cum_sum = np.cumsum(2 * bool_test - 1)
     assert cum_sum[-1] == 0
     val = np.max(cum_sum)
-    
+
     nltk_val = nltk.Tree.fromstring(tree_string).height() - 1
     assert val == nltk_val, (val, nltk_val)
     return val
 
 
 def tree_depth_from_ids(ids: List[int], tokenizer) -> int:
-    return tree_depth_from_str(tokenizer.decode(ids, False).split(tokenizer.eos_token, 1)[0])
+    return tree_depth_from_str(
+        tokenizer.decode(ids, False).split(tokenizer.eos_token, 1)[0]
+    )
 
 
 def tree_depth_from_ids_batch(ids: List[int], tokenizer) -> List[int]:
-    decoded_and_cleaned = [tokenizer.decode(x, False).split(tokenizer.eos_token, 1)[0] for x in ids]
+    decoded_and_cleaned = [
+        tokenizer.decode(x, False).split(tokenizer.eos_token, 1)[0] for x in ids
+    ]
     return [tree_depth_from_str(x) for x in decoded_and_cleaned]
+
 
 def get_all_desc(root: "Node") -> Generator["Node", None, None]:
     work_stack = [root]
     while work_stack:
         node = work_stack.pop()
         yield node
-        
+
         if node.get_children():
             work_stack.extend(node.get_children())
 
@@ -75,20 +82,21 @@ def multiple_get_all_desc(iterable: Iterable["Node"]) -> Generator["Node", None,
         yield from get_all_desc(node)
 
 
-def all_nodes_have_complexity_levels(all_nodes: "Node") -> bool:
+def all_nodes_have_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
     for node in all_nodes:
         if node.get_complexity_level() is None:
             return False
     return True
-    
 
-def all_nodes_have_unique_ids(all_nodes: "Node") -> bool:
+
+def all_nodes_have_unique_ids(all_nodes: Iterable["Node"]) -> bool:
     seen = set()
     for node in all_nodes:
         if id(node) in seen:
             return False
         seen.add(id(node))
     return True
+
 
 def all_nodes_have_root_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
     for node in all_nodes:
@@ -108,25 +116,29 @@ def prep_input_data(
     return input_ids, decoder_input_ids
 
 
-def load_dataset(json_path: str, pkl_path: str) -> Tuple[Dict[str, Dict[int, "Node"]], "NestedClacConfig"]:
+def load_dataset(
+    json_path: str, pkl_path: str
+) -> Tuple[DefaultDict[str, DefaultDict[int, "Node"]], "NestedClacConfig"]:
     LOGGER.debug(f"Reading and parsing dataset from {json_path} or from {pkl_path}")
 
-    rich.print("[blue]Loading data file.")
+    dicts: dict[str, Any]
     if pkl_path:
-        rich.print(f"[blue]Loading PKL data file \"{pkl_path}\"")
+        rich.print(f'Loading PKL data file "{pkl_path}"')
         with open(pkl_path, "rb") as f:
             dicts = pickle.load(f)
     else:
-        rich.print(f"[blue]Loading JSON data file \"{json_path}\"")
+        rich.print(f'Loading JSON data file "{json_path}"')
         assert json_path
         with open(json_path, "r") as f:
-            dicts = json.load(f)
-    rich.print("[blue]Done loading file.")
+            dicts = json.loads(f.read())
+    rich.print("Done loading file.")
 
     LOGGER.debug(f"Parsing structures from the dicts.")
     config = dicts["config"]
+    config_obj = NestedClacConfig.from_json_dict(config)
+
     data = dicts["data"]
-    
+
     assert isinstance(data, dict)
     assert set(data.keys()) == {"train", "eval"}, data.keys()
     for split in data.values():
@@ -137,18 +149,18 @@ def load_dataset(json_path: str, pkl_path: str) -> Tuple[Dict[str, Dict[int, "No
         assert "op" in split[1][0]
 
     print("Building nodes")
-    output = collections.defaultdict(lambda: collections.defaultdict(list))
+    output: DefaultDict[str, DefaultDict[int, list[Node]]] = collections.defaultdict(
+        lambda: collections.defaultdict(list)
+    )
     for split, split_data in data.items():
-        for level_idx, level_list in tqdm(split_data.items(), desc=f"Building nodes for {split}"):
+        for level_idx, level_list in tqdm(
+            split_data.items(), desc=f"Building nodes for {split}"
+        ):
             for node_dict in tqdm(level_list, desc=f"building level {level_idx} nodes"):
-                output[split][level_idx].append(
-                    Node.from_json_dict(
-                        node_dict
-                    )
-                )
+                output[split][level_idx].append(Node.from_json_dict(node_dict))
 
     LOGGER.debug(f"Done loading dataset.")
-    return output, NestedClacConfig.from_json_dict(config)
+    return output, config_obj
 
 
 class Node:
@@ -168,21 +180,23 @@ class Node:
         raise RuntimeError("Nodes are not shallow-copyable.")
 
     def __deepcopy__(self, memo):
-        
+
         assert self._root_complexity_level is None, (
             "self._root_complexity_level is not None, this is suspiscious behavior. "
             "It is not currently conserved by the deep copy. It could be though. "
         )
-        assert self._pseudo_value is None, (
-            "self._pseudo_value is not None, this is suspiscious."
-        )
+        assert (
+            self._pseudo_value is None
+        ), "self._pseudo_value is not None, this is suspiscious."
 
         return Node(
-            op=self._op, 
-            children=[copy.deepcopy(c, memo) for c in self._children] if self._children else None,
+            op=self._op,
+            children=[copy.deepcopy(c, memo) for c in self._children]
+            if self._children
+            else None,
             value=self._value,
             complexity_level=self._complexity_level,
-        ) 
+        )
 
     def __init__(
         self,
@@ -191,7 +205,7 @@ class Node:
         value: str,
         complexity_level: int,
     ):
-        self._op: str = op
+        self._op: Optional[str] = op
         self._children: List["Node"] = children
         self._value = str(value)
         self._input_str: Optional[str] = None
@@ -202,15 +216,16 @@ class Node:
         self._root_complexity_level: Optional[int] = None
 
     def get_complexity_level(self) -> int:
+        assert self._complexity_level is not None, "Complexity level is not set."
         return self._complexity_level
-    
+
     def get_root_complexity_level(self) -> int:
         return self._root_complexity_level
 
     def set_complexity_level(self, value: int) -> None:
         assert self._complexity_level is None
         self._complexity_level = value
-    
+
     def set_root_complexity_level(self, value: int) -> None:
         assert self._root_complexity_level is None
         self._root_complexity_level = value
@@ -261,7 +276,7 @@ class Node:
     def get_op(self) -> str:
         return self._op
 
-    def get_children(self) -> "Node":
+    def get_children(self) -> Optional[list["Node"]]:
         return self._children
 
     def get_value(self) -> str:
@@ -280,7 +295,7 @@ class Node:
                 self._input_str = f"{self.get_value()}"
         return self._input_str
 
-    def get_oracle_str(self) -> str:
+    def get_oracle_str(self) -> tuple[str, str]:
         """
         The situation is that if we do generation with the scratch pad fed in,
         we need to be given the left part of the final top most equation without
@@ -338,7 +353,7 @@ class Node:
         self._pseudo_value = value
 
     def get_pseudo_value(self) -> str:
-        if self.get_children() is None:
+        if not self.get_children():
             return self.get_value()
         return self._pseudo_value
 
@@ -359,7 +374,7 @@ class Node:
 
         """
         assert head_type in ["pred", "oracle"]
-        if self.get_children() is not None:
+        if self.get_children():
             if conc_mode == "yield":
                 a_str, _, masked_pseudo_a = yield from self.get_children()[
                     0
@@ -554,19 +569,19 @@ def generate(
                     good_ones = [(a, b) for a, b in zip(a_s, b_s) if a not in uniques]
                     uniques.update(good_ones[: qty_each_op - len(uniques)])
                     LOGGER.debug(f"[attempt] {qty_each_op} {len(uniques)}")
-            
+
             uniqe_roots = []
             for sub_node_a, sub_node_b in tqdm(uniques, desc="building nodes"):
-                # This compying is necessary because we save the depth of the 
+                # This compying is necessary because we save the depth of the
                 # node inside of the node, and the depth of a node will depend
                 # on what tree it belongs to, so we can't just reuse the nodes.
                 sub_node_a = copy.deepcopy(sub_node_a)
                 sub_node_b = copy.deepcopy(sub_node_b)
                 new_node = Node(
-                    op=op, 
-                    children=[sub_node_a, sub_node_b], 
-                    value=opmap[op](sub_node_a.get_value(), sub_node_b.get_value()), 
-                    complexity_level=complexity_level
+                    op=op,
+                    children=[sub_node_a, sub_node_b],
+                    value=opmap[op](sub_node_a.get_value(), sub_node_b.get_value()),
+                    complexity_level=complexity_level,
                 )
                 uniqe_roots.append(new_node)
 
@@ -597,7 +612,7 @@ def filter_length(
         answer_tokens = tokenizer(answer, None, no_eos=True)
         if len(answer_tokens) > max_len_answer:
             return False
-    
+
     return True
 
 
@@ -616,11 +631,9 @@ class FilterLengthFunctor:
 
     def __call__(self, root):
         return filter_length(
-            root, 
-            self.max_len_answer, 
-            self.max_len_total, 
-            self.tokenizer
+            root, self.max_len_answer, self.max_len_total, self.tokenizer
         )
+
 
 def zeroth_level(config):
     ###########################################################################
@@ -629,14 +642,26 @@ def zeroth_level(config):
     # for both sets. (& don't have subnodes)
     ###########################################################################
     train = [
-        Node(op=None, children=None, value=value, complexity_level=0,)
+        Node(
+            op=None,
+            children=None,
+            value=value,
+            complexity_level=0,
+        )
         for value in range(10 ** config.max_digits)
     ]
     eval = copy.deepcopy(train)
     return dict(train=train, eval=eval)
-    
 
-def first_level_and_more(config, qty, complexity_level, split_previous, all_split_previous, filter_length_lambda):
+
+def first_level_and_more(
+    config,
+    qty,
+    complexity_level,
+    split_previous,
+    all_split_previous,
+    filter_length_lambda,
+):
     ###########################################################################
     # Level 3 nodes.
     # Level 3 nodes are the first nodes where it isn't a special case in any
@@ -656,9 +681,9 @@ def first_level_and_more(config, qty, complexity_level, split_previous, all_spli
                 name=f"{split_name} {complexity_level}",
             )
         )
-        
+
         random.shuffle(new[split_name])
-        new[split_name] = new[split_name][: qty]
+        new[split_name] = new[split_name][:qty]
 
     return new
 
@@ -672,21 +697,26 @@ def generate_data(
     )
 
     zeroth_l = zeroth_level(config)
-    
+
     per_set = {split: {0: zeroth_l[split]} for split in ["train", "eval"]}
     for level in range(1, config.max_depth + 1):
         new = first_level_and_more(
             config=config,
-            qty=config.max_qty_per_level, 
-            complexity_level=level, 
-            split_previous={split: per_set[split][level - 1] for split in ["train", "eval"]}, 
-            all_split_previous={split: utils.concat_lists(per_set[split].values()) for split in ["train", "eval"]},  
-            filter_length_lambda=filter_length_lambda
+            qty=config.max_qty_per_level,
+            complexity_level=level,
+            split_previous={
+                split: per_set[split][level - 1] for split in ["train", "eval"]
+            },
+            all_split_previous={
+                split: utils.concat_lists(per_set[split].values())
+                for split in ["train", "eval"]
+            },
+            filter_length_lambda=filter_length_lambda,
         )
 
         for split, nodes in new.items():
             per_set[split][level] = nodes
-    
+
     # We don't save zeroth level nodes. There's nothing to learn from them.
     for per_level in per_set.values():
         del per_level[0]
@@ -718,7 +748,7 @@ def generate_data(
 
     print("Setting root_level_complexity.")
     for top_level_node in tqdm(all_root_nodes):
-        set_childrens_root_complexity_level(top_level_node)      
+        set_childrens_root_complexity_level(top_level_node)
 
     if DEBUG:
         print("Final check")
@@ -731,8 +761,8 @@ def generate_data(
     lengths = {}
     for cv_set_name, cv_set_per_level in tqdm(per_set.items()):
         lengths[cv_set_name] = {
-            level_idx: len(level_nodes) for 
-            level_idx, level_nodes in cv_set_per_level.items()
+            level_idx: len(level_nodes)
+            for level_idx, level_nodes in cv_set_per_level.items()
         }
 
     rich.print(lengths)
@@ -765,65 +795,81 @@ class PredLogger:
 
 class NestedClacConfig:
     # misc
-    
+
     def __init__(
-        self, *, 
-        max_depth: int, 
+        self,
+        *,
+        max_depth: int,
         max_total_length: int,
         max_answer_length: int,
+        max_qty_per_level: int,
     ):
-        self.max_depth = max_depth
-
+        # Checks
         assert max_total_length
-        assert max_total_length <= 1024, (
-            "This is the length of the whole context of BART, it's the hardest limit."
-        )
-        self.max_total_length = max_total_length
+        assert (
+            max_total_length < 1024
+        ), "This is the length of the whole context of BART, it's the hardest limit."
 
-        self.seed: int = 1337
-        # dataset
-        self.operators = {"+", "*", "-"}
-        self.max_digits = 1
-        self.max_qty_per_level = 10000
-        self.max_answer_length = max_answer_length
-        
-        self.output_name = f"{self.max_total_length}_{self.max_answer_length}_{self.max_depth}_{self.max_qty_per_level}.json"
-        
+        # Values coming from args
+        self.max_depth: Final[int] = max_depth
+        self.max_total_length: Final[int] = max_total_length
+        self.max_qty_per_level: Final[int] = max_qty_per_level
+        self.max_answer_length: Final[int] = max_answer_length
 
-    def to_json_dict(self):
+        # Hardcoded or computed values
+        self.seed: Final[int] = 1337
+        self.operators: Final[set[str]] = {"+", "*", "-"}
+        self.max_digits: Final[int] = 1
+        self.output_name: Final[
+            str
+        ] = f"{self.max_total_length}_{self.max_answer_length}_{self.max_depth}_{self.max_qty_per_level}.json"
+
+    def to_json_dict(self) -> dict[str, Any]:
         base_dict = vars(self)
         base_dict["operators"] = list(self.operators)
         return base_dict
 
     @classmethod
-    def from_json_dict(cls, json_dict):
-        
-        obj = cls(
-            max_depth=json_dict["max_depth"], 
-            max_total_length=json_dict["max_total_length"],
-            max_answer_length=json_dict["max_answer_length"],
-        )
+    def from_json_dict(cls, json_dict) -> "NestedClacConfig":
+
         json_dict["operators"] = set(json_dict["operators"])
 
-        assert json_dict.keys() == vars(obj).keys(), (
-            json_dict.keys() - vars(obj).keys(),  vars(obj).keys() - json_dict.keys()
+        config_obj = cls(
+            max_depth=json_dict["max_depth"],
+            max_total_length=json_dict["max_total_length"],
+            max_answer_length=json_dict["max_answer_length"],
+            max_qty_per_level=json_dict["max_qty_per_level"],
         )
-                
-        for k in json_dict.keys():
-            assert getattr(obj, k) == json_dict[k], (
-                k, json_dict[k], getattr(obj, k)
-            )
+        obj_dict: Final[dict[str, Any]] = vars(config_obj)
 
-        return obj
+        # Verify that the dicts are the same.
+        if not obj_dict == json_dict:
+            assert obj_dict.keys() == json_dict.keys(), (
+                obj_dict.keys() - json_dict.keys(),
+                json_dict.keys() - obj_dict.keys(),
+            )
+            different_values = {}
+            # Here the keys are guaranteed to be the same.
+            for k in obj_dict:
+                if obj_dict[k] != json_dict[k]:
+                    different_values[k] = (obj_dict[k], json_dict[k])
+            assert not different_values, different_values
+
+        return config_obj
 
 
 def main():
     # create basic config for logging
     logging.basicConfig(level=logging.DEBUG)
-    
-    config = NestedClacConfig(max_depth=6, max_total_length=349, max_answer_length=6)
+
+    config = NestedClacConfig(
+        max_depth=6,
+        max_total_length=349,
+        max_answer_length=6,
+        max_qty_per_level=200000,
+    )
     per_set = generate_data(config)
-    
+
     print("Building the dict object that will be saved.")
     dataset = {"data": {}, "config": config.to_json_dict()}
     data = dataset["data"]
@@ -833,9 +879,11 @@ def main():
         for level_name, nodes_per_level in nodes_per_level.items():
             assert level_name != 0, level_name
             split_dict[level_name] = [
-                sample.to_json_dict() for sample in tqdm(nodes_per_level, desc=f"Split {split} Level {level_name}")
+                sample.to_json_dict()
+                for sample in tqdm(
+                    nodes_per_level, desc=f"Split {split} Level {level_name}"
+                )
             ]
-    
 
     print("Saving the data.")
     start = time.perf_counter()
@@ -847,6 +895,7 @@ def main():
     with open(SCRIPT_DIR / "data" / config.output_name, "w") as f:
         f.write(json.dumps(dataset, indent=4))
     print(f"Dumped json in {time.perf_counter() - start:0.2f} seconds")
+
 
 if __name__ == "__main__":
     main()

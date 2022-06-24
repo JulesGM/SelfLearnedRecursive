@@ -41,13 +41,19 @@ def dict_unzip(list_of_dicts):
     return dict_of_lists
 
 
+def find_last(seq, item):
+    return len(seq) - seq[::-1].index(item) - 1
+
+
 def concat_lists(lists):
-    [isinstance(l, list,) for l in lists]
+    assert all(isinstance(l, list) for l in lists)
     return sum(lists, [])
 
+
 def concat_tuples(tuples):
-    [isinstance(l, tuple) for l in tuples]
+    assert all(isinstance(l, tuple) for l in tuples)
     return sum(tuples, ())
+
 
 def concat_iters(iters):
     return list(itertools.chain.from_iterable(iters))

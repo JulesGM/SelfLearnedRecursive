@@ -178,3 +178,9 @@ DATASET_TYPES = dict(
     oracle_basic_dataset=OracleBasicDataset,
     self_learned_basic_dataset=CurriculumSelfLearned,
 )
+
+
+class DatasetTypesChoices:
+    most_basic_dataset = "most_basic_dataset"
+    oracle_basic_dataset = "oracle_basic_dataset"
+    self_learned_basic_dataset = "self_learned_basic_dataset"

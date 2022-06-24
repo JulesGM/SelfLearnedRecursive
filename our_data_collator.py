@@ -67,17 +67,17 @@ class DataCollatorWithDecoderInputIds:
 
     def __init__(
         self,
-        tokenizer: transformers.PreTrainedTokenizerBase,
+        tokenizer,
         model: transformers.PreTrainedModel,
         max_length: int,
         mask_intermediate_labels: bool,
         label_pad_token_id: int = -100,
     ):
-        self._tokenizer = tokenizer
-        self._model = model
-        self._max_length = max_length
-        self._mask_intermediate_labels = mask_intermediate_labels
-        self._label_pad_token_id = label_pad_token_id
+        self._tokenizer: Final = tokenizer
+        self._model: Final[transformers.PretrainedModel] = model
+        self._max_length: Final[int] = max_length
+        self._mask_intermediate_labels: Final[bool] = mask_intermediate_labels
+        self._label_pad_token_id: Final[int] = label_pad_token_id
 
     def __call__(self, features):
         """
@@ -117,8 +117,9 @@ class DataCollatorWithDecoderInputIds:
         assert "input_ids" in keys
         DECODER_PAD_DIRECTION = "left"
 
-
-        levels = datagen.tree_depth_from_ids_batch([x["input_ids"] for x in features], self._tokenizer)
+        levels = datagen.tree_depth_from_ids_batch(
+            [x["input_ids"] for x in features], self._tokenizer
+        )
         print("In collator")
         rich.print(collections.Counter(levels))
 

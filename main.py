@@ -1,4 +1,4 @@
-print("Importing modules")
+print("Importing modules.")
 from beartype.typing import *
 
 import collections
@@ -26,7 +26,6 @@ import ujson as json
 import wandb
 
 import pretty_traceback
-
 pretty_traceback.install()
 
 import datagen
@@ -36,7 +35,7 @@ import our_metrics
 import our_tokenizer
 import modded_bart
 import utils
-print("Done loading modules")
+print("Done loading modules.\n")
 
 SCRIPT_DIR = Path(__file__).absolute().parent
 LOGGER = logging.getLogger(__name__)
@@ -50,16 +49,15 @@ class ValidModes:
 
 
 #########################################################################################################
-RUN_NAME_DEFAULT = "experimentation"
 ACTIVE_MODES = {ValidModes.per_batch}
 NUM_BATCHES_VALID = 5
 EVAL_EVERY_N_EPOCHS = 2
 
-N_LAYERS = 2
-N_HEADS = 4
-H_SIZE = 64
+# N_LAYERS = 2
+# N_HEADS = 4
+# H_SIZE = 64
 
-BATCH_SIZE = 1024
+
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0
 MAX_ANSWER_GEN = 5
@@ -75,8 +73,18 @@ GENERATION_KWARGS = dict(
     do_sample=False,
 )
 
+# Stuff that should never change
+NUM_GPUS = 1
+WANDB_ENTITY = "julesgm"
+WANDB_PROJECT = "self_learned_explanations"
+PRECISION = 16
+DATA_PATH = SCRIPT_DIR / "data"
 
-def generate(model: modded_bart.ModifiedBartForConditionalGeneration, **kwargs):
+
+
+def generate(model: transformers.PreTrainedModel, **kwargs):
+    assert isinstance(model, modded_bart.ModifiedBartForConditionalGeneration), "only type currently supported"
+
     for k in GENERATION_KWARGS.keys():
         assert GENERATION_KWARGS[k] == kwargs[k], f"{k} mismatch"
 
@@ -98,9 +106,7 @@ def clean_sample_for_logging(tokens, tokenizer):
     Only removes -100 tokens values.
     """
     tokens_list = tokens.cpu().numpy().tolist()
-
     as_string = tokenizer.decode(tokens_list, ignore_special_symbols=False)
-
     pale_map = {
         "<-100>": "[bright_cyan]#[/bright_cyan]",
         "<pad>": "[bright_cyan]^[/bright_cyan]",
@@ -121,10 +127,6 @@ def clean_sample_for_logging(tokens, tokenizer):
         as_string = as_string.replace(token, new_v)
 
     return as_string
-
-
-def find_last(seq, item):
-    return len(seq) - seq[::-1].index(item) - 1
 
 
 def prep_return_data(output, decoder_input_ids, tokenizer):
@@ -229,7 +231,7 @@ class PLBart(pl.LightningModule):
     def __init__(
         self,
         *,
-        model,
+        model: transformers.PreTrainedModel,
         tokenizer: our_tokenizer.Tokenizer,
         train_ds,
         eval_ds,
@@ -244,8 +246,7 @@ class PLBart(pl.LightningModule):
         # scheduler_kwargs,
         # do_allen_nlp_predictions: bool,
         curriculum_mode: str,
-        max_generation_quantity_valid: int,
-        freeform_options: Sequence[str],
+        freeform_options: set[bool],
         max_total_length_gen: int,
         max_answer_gen: int,
         max_depth: int
@@ -254,34 +255,33 @@ class PLBart(pl.LightningModule):
         self.mask_intermediate_labels = isinstance(
             train_ds, our_datasets.SelfLearnedBasicDataset
         )
-        self.max_depth = max_depth
-        self.max_answer_gen = max_answer_gen
-        self.max_total_length_gen = max_total_length_gen
-        self.shuffle_train = True
-        self.shuffle_val = False
-        self.tokenizer = tokenizer
-        self.model = model
-        self.batch_size = train_batch_size
-        self.eval_batch_size = eval_batch_size
-        self.generation_kwargs = generation_kwargs
-        self.logging_conf = dict(
+        self.max_depth: Final[int] = max_depth
+        self.max_answer_gen: Final[int] = max_answer_gen
+        self.max_total_length_gen: Final[int] = max_total_length_gen
+        self.shuffle_train: Final = True
+        self.shuffle_val: Final = False
+        self.tokenizer: Final = tokenizer
+        self.model: transformers.PreTrainedModel = model
+        self.batch_size: Final[int] = train_batch_size
+        self.eval_batch_size: Final[int] = eval_batch_size
+        self.generation_kwargs: Final[dict[str, Any]] = generation_kwargs
+        self.logging_conf: Final[dict[str, bool]] = dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True
         )
-        self.max_generation_quantity_valid = max_generation_quantity_valid
-        self.freeform_options = freeform_options
+        self.freeform_options: Final[set[bool]] = freeform_options
 
         # Related to datasets
         assert train_ds is not eval_ds, (
             "train_ds and eval_ds must be different objects"
         )
-        self.train_ds = train_ds
-        self.eval_ds = eval_ds
-        self.num_workers_dl = num_workers_dl
+        self.train_ds: Final = train_ds
+        self.eval_ds: Final = eval_ds
+        self.num_workers_dl: Final[int] = num_workers_dl
 
         # Specific to the optimizer:
-        self.learning_rate = learning_rate
-        self.is_adamw = is_adamw
-        self.weight_decay = weight_decay
+        self.learning_rate: Final[float] = learning_rate
+        self.is_adamw: Final[bool] = is_adamw
+        self.weight_decay: Final = weight_decay
 
         # # Related to the scheduler:
         # self.scheduler_type =         scheduler_type
@@ -342,7 +342,7 @@ class PLBart(pl.LightningModule):
         loss: torch.Tensor = self(**batch).loss
         things_to_log = dict(eval_loss=loss)
         per_batch_preds = None
-        self.model = self.model.eval()
+        self.model: transformers.PreTrainedModel = self.model.eval()
 
         #######################################################################
         # Print every N batches
@@ -491,10 +491,10 @@ class PLBart(pl.LightningModule):
 
                     if self.eval_ds.has_decoder_input_ids_for_gen and not is_freeform:
                         clean_pred = clean_pred[
-                            find_last(clean_pred, self.tokenizer.token_to_idx["="]) :
+                            utils.find_last(clean_pred, self.tokenizer.token_to_idx["="]) :
                         ]
                         clean_label = clean_label[
-                            find_last(clean_label, self.tokenizer.token_to_idx["="]) :
+                            utils.find_last(clean_label, self.tokenizer.token_to_idx["="]) :
                         ]
 
                     if do_print:
@@ -935,8 +935,8 @@ class PLBart(pl.LightningModule):
 
             return RenewableGenerator(
                 lambda: self._make_dataloader(
-                    self.train_ds,
-                    self.batch_size,
+                    ds=self.train_ds,
+                    batch_size=self.batch_size,
                     shuffle=self.shuffle_train,
                     dl_name="train_dl",
                 ),
@@ -958,8 +958,8 @@ class PLBart(pl.LightningModule):
 
             return RenewableGenerator(
                 lambda: self._make_dataloader(
-                    self.eval_ds,
-                    self.batch_size,
+                    ds=self.eval_ds,
+                    batch_size=self.batch_size,
                     shuffle=self.shuffle_val,
                     dl_name="val_dl",
                 ),
@@ -973,20 +973,63 @@ class PLBart(pl.LightningModule):
             )
 
 
+
 def main(
+    # Should not change
+    data_name="349_6_6_10000.json.pkl",    
+    inf_num=6,
+    use_fixed_pos_embs=True,
+    
+    use_rel_pos_embs=True,
+    num_rel_pos_embs=64,
+
+    # Changes often
     freeform_options=[True, False],
-    dataset_type="oracle_basic_dataset",
-    max_level_training=3,
-    data_name="349_6_6_200000.json.pkl",    
-    run_name=RUN_NAME_DEFAULT,
+    dataset_type=our_datasets.DatasetTypesChoices.most_basic_dataset,
+    max_level_training=6,
+
+    # Changes with model size
+    batch_size=256,
+
+    # Model Stuff
+    
+    # Small config
+    h_size=64,
+    n_layers=2,
+    n_heads=4,
+
+    # Bigger Config
+    # h_size=256,
+    # n_layers=4,
+    # n_heads=4,
 ):
 
+    if dataset_type == our_datasets.DatasetTypesChoices.most_basic_dataset:
+        ds_str = "most_basic"
+    elif dataset_type == our_datasets.DatasetTypesChoices.oracle_basic_dataset:
+        ds_str = "oracle"
+    else:
+        raise ValueError("Unknown dataset type")
+    
+    fix_str = "fixed_pe" if use_fixed_pos_embs else "trainable_pe"
+    rel_str = f"rel_pe_{num_rel_pos_embs}_" if use_rel_pos_embs else ""
+    run_name = f"{rel_str}{fix_str}_trained_{max_level_training}_inf_{inf_num}_{ds_str}_h_size_{h_size}_n_layers_{n_layers}_n_heads_{n_heads}"
+
+    rich.print(f"Run name: [green]'{run_name}'\n")
+
     rich.print(
+        "Parsed execution arguments:\n",
+        f"\t- {data_name = }\n"
+        f"\t- {inf_num = }\n"
+        
         f"\t- {freeform_options = }\n"
         f"\t- {dataset_type = }\n"
         f"\t- {max_level_training = }\n"
-        f"\t- {data_name = }\n"
-        f"\t- {run_name = }"
+        
+        f"\t- {batch_size = }\n"
+        f"\t- {h_size = }\n"
+        f"\t- {n_layers = }\n"
+        f"\t- {n_heads = }\n",
     )
 
     assert dataset_type in our_datasets.DATASET_TYPES, dataset_type
@@ -994,19 +1037,13 @@ def main(
     assert isinstance(freeform_options, (list, tuple, set)), freeform_options
     assert all(isinstance(x, bool) for x in freeform_options)
 
-    NUM_GPUS = 1
-    WANDB_ENTITY = "julesgm"
-    WANDB_PROJECT = "self_learned_explanations"
-    TRAIN_BATCH_SIZE = BATCH_SIZE
-    MAX_GENERATION_QUANTITY_VALID = min(128, TRAIN_BATCH_SIZE)
-    EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE
-    PRECISION = 16
-
-    DATA_PATH = SCRIPT_DIR / "data"
     dataset, dataset_config = datagen.load_dataset(None, DATA_PATH / data_name)
-
+    rich.print(vars(dataset_config))
+    
     train_ds : Dict[int, datagen.Node] = dataset["train"]
     valid_ds : Dict[int, datagen.Node] = dataset["eval"]
+    assert len(train_ds) == inf_num, (len(train_ds), inf_num)
+
     if max_level_training:
         assert max_level_training <= dataset_config.max_depth
         assert all(isinstance(node_name, int) for node_name in train_ds)
@@ -1048,16 +1085,21 @@ def main(
     ###############################################################
     # Can change
     ###############################################################
-    config.num_hidden_layers = N_LAYERS  # Default is 6
-    config.hidden_size = H_SIZE  # Default is 768
-    config.encoder_attention_heads = N_HEADS  # Default is 16
-    config.decoder_attention_heads = N_HEADS  # Default is 16
+    config.num_hidden_layers = n_layers  # Default is 6
+    config.hidden_size = h_size  # Default is 768
+    config.encoder_attention_heads = n_heads  # Default is 16
+    config.decoder_attention_heads = n_heads  # Default is 16
     config.encoder_ffn_dim = config.hidden_size * 4  # Default is 4096
     config.decoder_ffn_dim = config.hidden_size * 4
 
     # The only difference is that we take decoder_attention_masks into account
     # for positional embeddings
-    model = modded_bart.ModifiedBartForConditionalGeneration(config)
+    model = modded_bart.ModifiedBartForConditionalGeneration(
+        config, 
+        use_fixed_pos_embs=use_fixed_pos_embs,
+        use_rel_pos_embs=use_rel_pos_embs,
+        num_rel_pos_embs=num_rel_pos_embs,
+    )
 
     assert type(train_torch_dataset) == type(valid_torch_dataset), (
         type(train_torch_dataset),
@@ -1075,13 +1117,15 @@ def main(
 
         assert CONC_MODE in ["yield", "top_sort"], CONC_MODE
 
+
+    eval_batch_size = batch_size * 2
     pl_object = PLBart(
         model=model,
         tokenizer=tokenizer,
         train_ds=train_torch_dataset,
         eval_ds=valid_torch_dataset,
-        train_batch_size=TRAIN_BATCH_SIZE,
-        eval_batch_size=EVAL_BATCH_SIZE,
+        train_batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
         num_workers_dl=0,
         generation_kwargs=GENERATION_KWARGS,
         learning_rate=LEARNING_RATE,
@@ -1093,7 +1137,6 @@ def main(
         max_total_length_gen=dataset_config.max_total_length,
         max_answer_gen=dataset_config.max_answer_length,
         curriculum_mode=None,
-        max_generation_quantity_valid=MAX_GENERATION_QUANTITY_VALID,
         freeform_options=freeform_options,
         max_depth=dataset_config.max_depth,
     )
@@ -1104,15 +1147,17 @@ def main(
         entity=WANDB_ENTITY,
         log_model=False,
         config=dict(
+            bart_config=vars(config),
             dataset_type=type(train_torch_dataset).__name__,
+            eval_batch_size=eval_batch_size,
             freeform_mode=list(freeform_options),
-            train_batch_size=TRAIN_BATCH_SIZE,
-            eval_batch_size=EVAL_BATCH_SIZE,
+            generation_kwargs=GENERATION_KWARGS,
             learning_rate=LEARNING_RATE,
             num_gpus=NUM_GPUS,
             precision=PRECISION,
-            bart_config=vars(config),
-            generation_kwargs=GENERATION_KWARGS,
+            train_batch_size=batch_size,
+            max_level_training=max_level_training,
+            use_fixed_pos_embs=use_fixed_pos_embs,
         ),
     )
     wandb.run.log_code(SCRIPT_DIR)

@@ -1,44 +1,81 @@
 """
 Deletes runs that are under a certain duration or that don't have a recorded duration at all.
 """
-import rich
-import wandb
+import datetime
+
+from typing import *
 import pretty_traceback
+import rich
+import rich.table
+import wandb
+
 pretty_traceback.install()
 
+
+FILL_CHAR = " "
+NORMALIZED_LEN = 2
 NUM_MINUTES_TO_KEEP = 30
 PROJECT = "julesgm/self_learned_explanations"
 
-def parse_time(seconds):
+
+def parse_time(seconds: int) -> Tuple[int, int, int]:
     hours = seconds // 60 // 60
     minutes = (seconds // 60) % 60
-    seconds = seconds % 60
-    return hours, minutes, seconds
+    norm_seconds = seconds % 60
+    return hours, minutes, norm_seconds
+
+
+def len_normalize_num_str(num: int, target_l: int, fill_char: str) -> str:
+    num = str(num)
+    if len(num) < target_l:
+        num = (target_l - len(num)) * fill_char + num
+    return num
+
 
 def main():
     assert NUM_MINUTES_TO_KEEP < 60, "Use hours if you want more than 59 minutes."
+
     # Get all runs
-    runs = list(wandb.Api().runs(PROJECT))
-    # Get all short runs
+    try:
+        runs = list(wandb.Api().runs(PROJECT))
+    except Exception as err:
+        err.args += f"{NUM_MINUTES_TO_KEEP = }"
+        raise err
+
+    table = rich.table.Table("Name", "Runtime", "Action", "Date")
     for run in runs:
-        print(run.name)
-        print(run.state)
+        # run.state
+        maybe_timestamp_str = run.summary.get("_timestamp", None)
+        name_str = f"[bold bright_cyan]{run.name}"
+
+        if maybe_timestamp_str:
+            timestamp_str = (
+                f"[gray]{datetime.datetime.fromtimestamp(run.summary['_timestamp'])}"
+            )
+        else:
+            timestamp_str = "[red]No timestamp."
+
         if "_runtime" in run.summary:
             hours, minutes, seconds = parse_time(run.summary["_runtime"])
-            print(f"Runtime: {hours}h {minutes}m {seconds}s")
+
+            seconds_str = len_normalize_num_str(seconds, NORMALIZED_LEN, FILL_CHAR)
+            minutes_str = len_normalize_num_str(minutes, NORMALIZED_LEN, FILL_CHAR)
+            hours_str = len_normalize_num_str(hours, NORMALIZED_LEN, FILL_CHAR)
+
+            time_str = f"{hours_str}h {minutes_str}m {seconds_str}s"
+
             if run.state != "running" and minutes < NUM_MINUTES_TO_KEEP and hours == 0:
+                table.add_row(name_str, time_str, "[red]Deleting.", timestamp_str)
                 run.delete()
-                rich.print("[red]deleting")
+            else:
+                table.add_row(name_str, time_str, "-", timestamp_str)
+
         else:
+            table.add_row(name_str, "[red]No runtime.", "[red]Deleting.", timestamp_str)
             run.delete()
-            print("No runtime.")
-            rich.print("[red]deleting")
-            print(run.summary)
-        if "_step" in run.summary:
-            print(run.summary["_step"])
-        else:
-            print("No step")
-        print()
+
+    rich.print(f"Minimum duration: {NUM_MINUTES_TO_KEEP} min")
+    rich.print(table)
 
 
 if __name__ == "__main__":

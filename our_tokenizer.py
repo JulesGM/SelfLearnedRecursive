@@ -3,6 +3,7 @@ from beartype.typing import *
 import numpy as np
 import torch
 
+
 class Tokenizer:
     __slots__ = (
         "vocab",
@@ -22,6 +23,20 @@ class Tokenizer:
     )
 
     def __init__(self):
+        self.vocab = None
+        self.token_to_idx = None
+        self.idx_to_token = None
+        self.bos_token = None
+        self.bos_token_id = None
+        self.decoder_start_token = None
+        self.decoder_start_token_id = None
+        self.eos_token = None
+        self.eos_token_id = None
+        self.pad_token = None
+        self.pad_token_id = None
+        self.padding_side = None
+        self.special_tokens = None
+        self.special_token_ids = None
         raise NotImplementedError()
 
     def strip_special_tokens(self, input_text):
@@ -32,40 +47,39 @@ class Tokenizer:
     def encode(
         self,
         input_str: str,
-        return_tensors: str = "np",
+        return_tensors: Optional[str] = "np",
         *,
         no_eos: bool = False,
         strip_special_symbols: bool = False,
-    ) -> Sequence:
+    ) -> Union[np.ndarray, torch.Tensor, list]:
         assert type(input_str) == str, type(input_str)
 
         if strip_special_symbols:
             input_str = self.strip_special_tokens(input_str)
 
-        output = []
+        unprocessed_output: Final[list[int]] = []
         for char in input_str:
             if char in self.token_to_idx:
-                output.append(self.token_to_idx[char])
+                unprocessed_output.append(self.token_to_idx[char])
             else:
                 if char == " ":
                     continue
                 else:
                     raise ValueError(f"Unknown token '{char}'")
+
         if no_eos:
-            list_form = output
+            list_form = unprocessed_output
         else:
-            list_form = output + [self.token_to_idx["<eos>"]]
+            list_form = unprocessed_output + [self.token_to_idx["<eos>"]]
 
         if return_tensors is None:
-            output = list_form
+            return list_form
         elif return_tensors == "np":
-            output = np.array(list_form, dtype=np.int64)
+            return np.array(list_form, dtype=np.int64)
         elif return_tensors == "pt":
-            output = torch.tensor(list_form, dtype=torch.int64)
+            return torch.tensor(list_form, dtype=torch.int64)
         else:
             raise ValueError(f"Unknown return_tensors value '{return_tensors}'")
-
-        return output
 
     def decode(self, input_tokens: List[int], ignore_special_symbols: bool) -> str:
 
@@ -99,7 +113,7 @@ class Tokenizer:
         max_length: int,
         pad_to_multiple_of: bool,
         return_tensors: str = "np",
-    ) -> Sequence:
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, torch.Tensor], Dict[str, list[int]]]:
         """Pad input_token_ids, create attention_mask, convert everything to tensors.
         Mirrors huggingface tokenizers that way.
         """
@@ -136,6 +150,7 @@ class Tokenizer:
             for k in keys:
                 seq = [x[k] for x in padded_sequences]
                 output[k] = np.array(seq, dtype=np.int64)
+
             return output
 
         elif return_tensors == "pt":
