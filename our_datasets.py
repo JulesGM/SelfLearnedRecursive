@@ -22,7 +22,7 @@ class MostBasicDataset(torch.utils.data.Dataset):
         dataset: Dict[str, List[datagen.Node]],
         tokenizer: our_tokenizer.Tokenizer,
     ):
-        self.dataset = sum(dataset.values(), [])
+        self.dataset: list[datagen.Node] = sum(dataset.values(), [])
         random.shuffle(self.dataset)
         self.tokenizer = tokenizer
 
@@ -44,28 +44,27 @@ class OracleBasicDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        dataset: Dict[str, List[datagen.Node]],
+        dataset: Dict[str, list[datagen.Node]],
         tokenizer: our_tokenizer.Tokenizer,
     ):
-        self.dataset = sum(dataset.values(), [])
-        assert isinstance(self.dataset, list)
-        assert isinstance(self.dataset[0], datagen.Node)
-
-        random.shuffle(self.dataset)
-        self.tokenizer = tokenizer
+        self._tokenizer = tokenizer
+        self._dataset: list[datagen.Node] = sum(dataset.values(), [])
+        assert isinstance(self._dataset, list)
+        assert isinstance(self._dataset[0], datagen.Node)
+        random.shuffle(self._dataset)
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self._dataset)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-
-        encoder_input = self.dataset[idx].get_input_str()
-        label, decoder_input_for_gen = self.dataset[idx].get_oracle_str()
+    def __getitem__(self, idx: int) -> dict[str, Union[np.ndarray, str]]:
+        encoder_input = self._dataset[idx].get_input_str()
+        label, decoder_input_for_gen = self._dataset[idx].get_oracle_str()
 
         return dict(
-            input_ids=self.tokenizer(encoder_input),
-            labels=self.tokenizer(label),
-            decoder_input_ids_for_gen=self.tokenizer(decoder_input_for_gen),
+            input_ids=cast(np.ndarray, self._tokenizer(encoder_input, return_tensors="np")),
+            labels=cast(np.ndarray, self._tokenizer(label, return_tensors="np")),
+            decoder_input_ids_for_gen=cast(np.ndarray, self._tokenizer(decoder_input_for_gen, return_tensors="np")),
+            idents=self._dataset[idx].get_ident(),
         )
 
 
@@ -75,15 +74,18 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        dataset: Dict[str, List[datagen.Node]],
+        dataset: Dict[str, list[datagen.Node]],
         tokenizer: our_tokenizer.Tokenizer,
     ):
-        self._dataset = sum(dataset.values(), [])
+
+        self._dataset: list[datagen.Node] = sum(dataset.values(), [])
         random.shuffle(self._dataset)
 
         self._tokenizer = tokenizer
-        self._conc_mode = None
-        self._mask_intermediate_labels = None
+        self._conc_mode: Optional[str] = None
+        self._mask_intermediate_labels: Optional[bool] = None
+        assert False, "Not tested in a while"
+
 
     def has_len(self) -> bool:
         return hasattr(self._dataset, "__len__")
@@ -98,6 +100,7 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
         self._mask_intermediate_labels = mask_intermediate_labels
 
     def get(self, idx: int, pred_logger: datagen.PredLogger) -> Dict[str, torch.Tensor]:
+        assert False, "not tested in a while"
         input_ = self._dataset[idx].get_input_str()
         if self._conc_mode == "top_sort":
             self._dataset[idx].reset_pseudo_values()
@@ -161,6 +164,7 @@ class CurriculumSelfLearned(SelfLearnedBasicDataset):
         super().__init__(dataset, tokenizer)
         self._split_datasets = dataset
         self._dataset = None
+        assert False, "Not tested in a while"
 
     def mix(self, mix_: Dict[int, float]) -> None:
         assert len(mix_) == len(self._split_datasets)

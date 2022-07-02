@@ -1,5 +1,11 @@
 from beartype.typing import *
+import math
+import time
 
+import pretty_traceback  # type: ignore
+pretty_traceback.install()
+
+from tqdm import tqdm  # type: ignore
 import torch
 from torch import nn
 import numpy as np
@@ -51,16 +57,18 @@ class RelAttBartAttention(nn.Module):
         rel_att_keys: torch.nn.Embedding,
         rel_att_values: torch.nn.Embedding,
         key_value_states: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: Optional[tuple[torch.Tensor, ...]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, ...]]]:
         """Input shape: Batch x Time x Channel"""
+
 
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
         is_cross_attention = key_value_states is not None
+        assert not is_cross_attention, "relative positions only makes sense for self attention"
 
         bsz, tgt_len, _ = hidden_states.size()
 
@@ -96,13 +104,31 @@ class RelAttBartAttention(nn.Module):
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             past_key_value = (key_states, value_states)
 
+        
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
-        key_states = key_states.view(*proj_shape) + rel_att_keys
-        value_states = value_states.view(*proj_shape) + rel_att_values
-
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape) # 
+        key_states = key_states.view(*proj_shape) # + rel_att_keys
+        value_states = value_states.view(*proj_shape) # + rel_att_values
+        
         src_len = key_states.size(1)
+
+        rel_att_keys = rel_att_keys.view(bsz * self.num_heads, src_len, src_len, self.head_dim)  # type: ignore[operator]
+        rel_att_values = rel_att_values.view(bsz * self.num_heads, src_len, tgt_len, self.head_dim)  # type: ignore[operator]
+
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        dtype = attn_weights.dtype 
+        
+        # Rel Att
+        dummy_query_states = query_states.view(bsz * self.num_heads, tgt_len, 1      , self.head_dim) # .repeat(1, 1      , src_len, 1)
+        dummy_key_states   = key_states  .view(bsz * self.num_heads, 1      , src_len, self.head_dim) #.repeat(1, tgt_len, 1      , 1)
+        dummy_value_states = value_states.view(bsz * self.num_heads, src_len, 1      , self.head_dim) #.repeat(1, 1      , src_len, 1)
+
+
+        dummy_key_states_rel = (dummy_key_states + rel_att_keys)
+        dummy_atten_weights_b = torch.einsum("ijkl, ijkl->ijk", (dummy_query_states, dummy_key_states))
+        
+        assert dummy_atten_weights_b.shape == attn_weights.shape, f"{dummy_atten_weights_b.shape} != {attn_weights.shape}"
+        assert torch.allclose(attn_weights, dummy_atten_weights_b), "ref <> b"        
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -150,6 +176,7 @@ class RelAttBartAttention(nn.Module):
             attn_weights, p=self.dropout, training=self.training
         )
 
+        value_states_rel = dummy_value_states + rel_att_values
         attn_output = torch.bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
@@ -169,23 +196,48 @@ class RelAttBartAttention(nn.Module):
         return attn_output, attn_weights_reshaped, past_key_value
 
 
-@torch.jit.script
-def _build_rel_att_mat(
+def clamp(x: Union[float, int], min_: Union[float, int], max_: Union[float, int]):
+    return min(max(x, min_), max_)
+
+def _build_rel_att_mat_ref(
     attention_mask: torch.Tensor,
     num_embeddings: int,
-    seq_len: int,
-    batch_size: int,
 ):
-    relative_ids_test = torch.empty(batch_size, seq_len, seq_len, dtype=torch.long)
-    for i in range(batch_size):
-        for j in range(seq_len):
-            incr_int = 0
-            for k in range(seq_len):
-                relative_ids_test[i, j, k] = torch.clamp(torch.tensor(-i + incr_int + num_embeddings // 2), min=0, max=num_embeddings - 1)
-                incr_int += 1
-                if attention_mask[i, j]:
-                    incr_int += 1
+    batch_size = attention_mask.shape[0]
+    seq_len = attention_mask.shape[1]
+    relative_ids_test = torch.empty(
+        batch_size, seq_len, seq_len, 
+        dtype=torch.long
+    )
+    for batch_idx in range(batch_size):
+        q_incr = 0
+        for q_idx in range(seq_len):
+            if attention_mask[batch_idx, q_idx]:
+                q_incr += 1
+
+            k_incr = 0
+            for k_idx in range(seq_len):
+                if attention_mask[batch_idx, k_idx]:
+                    k_incr += 1
+
+                relative_ids_test[batch_idx, q_idx, k_idx] = clamp(
+                    k_incr - q_incr + num_embeddings // 2, 
+                    0, num_embeddings - 1
+                )
+                    
     return relative_ids_test
+
+
+def _build_rel_att_mat_test(
+    attention_mask: torch.Tensor,
+    num_embeddings: int,
+):
+    query_idx = attention_mask.cumsum(-1).reshape(attention_mask.shape[0], attention_mask.shape[1], 1)
+    key_idx = attention_mask.cumsum(-1).reshape(attention_mask.shape[0], 1, attention_mask.shape[1])
+    output = torch.clamp(key_idx - query_idx  + num_embeddings // 2, 0, num_embeddings - 1)
+
+    return output
+
 
 class RelAttBartEncoderLayer(nn.Module):
     def __init__(self, config: original.BartConfig):
@@ -212,7 +264,7 @@ class RelAttBartEncoderLayer(nn.Module):
         rel_att_keys: torch.Tensor,
         rel_att_values: torch.Tensor,
         output_attentions: bool = False,
-    ):
+    ) -> tuple[torch.Tensor, ...]:
         """
         Args:
             hidden_states (`torch.FloatTensor`): input to the layer of shape `(seq_len, batch, embed_dim)`
@@ -259,7 +311,7 @@ class RelAttBartEncoderLayer(nn.Module):
                 hidden_states, min=-clamp_value, max=clamp_value
             )
 
-        outputs = (hidden_states,)
+        outputs: tuple[torch.Tensor, ...] = (hidden_states,)
 
         if output_attentions:
             outputs += (attn_weights,)
@@ -267,45 +319,58 @@ class RelAttBartEncoderLayer(nn.Module):
         return outputs
 
 
+class RelPosEmbsChoices:
+    no_rel_pos_embs = "no_rel_pos_embs"
+    one_embedder = "one_embedder"
+    two_embedders = "two_embedders"
+    __choices__ = {one_embedder, two_embedders, no_rel_pos_embs}
+
+
 class RelPosEmbs(nn.Module):
-    def __init__(self, model_d: int, num_embeddings: int, mode: int):
+    def __init__(self, model_d: int, num_embeddings: int, mode: str):
         super().__init__()
+        assert mode != RelPosEmbsChoices.no_rel_pos_embs, "RelPosEmbs Should not be initialized in this case"    
+        assert mode in RelPosEmbsChoices.__choices__, f"mode {mode} not in {RelPosEmbsChoices.__choices__}"
+
         self.mode = mode
         self.num_embeddings = num_embeddings
 
-        if mode == 1:
-            self.positional_embeddings_k = nn.Linear(
-                num_embeddings, model_d, bias=False
+        if mode == RelPosEmbsChoices.two_embedders:
+            self.positional_embeddings_k = nn.Embedding(
+                num_embeddings=num_embeddings, embedding_dim=model_d
             )
-            self.positional_embeddings_v = nn.Linear(
-                num_embeddings, model_d, bias=False
+            self.positional_embeddings_v = nn.Embedding(
+                num_embeddings=num_embeddings, embedding_dim=model_d, 
             )
-
-        if mode == 2:
-            self.positional_embeddings = nn.Linear(num_embeddings, model_d, bias=False)
-            self.positional_embeddings_k = nn.Linear(model_d, model_d)
-            self.positional_embeddings_v = nn.Linear(model_d, model_d)
+        elif mode == RelPosEmbsChoices.two_embedders:
+            self.positional_embeddings = nn.Embedding(
+                num_embeddings=num_embeddings, embedding_dim=model_d
+            )
+            self.positional_embeddings_linear_k = nn.Linear(model_d, model_d)
+            self.positional_embeddings_linear_v = nn.Linear(model_d, model_d)
+        else:
+            raise ValueError(f"mode must be 1 or 2, got {mode}")
 
     def forward(self, attention_mask: torch.Tensor):
-        assert len(attention_mask.shape) == 3, len(attention_mask.shape)
-        
-        batch_size = attention_mask.shape[0]
-        seq_len = attention_mask.shape[1]
+        assert len(attention_mask.shape) == 2, len(attention_mask.shape)
 
-        positions = _build_rel_att_mat(
+        positions = _build_rel_att_mat_test(
             attention_mask=attention_mask, 
             num_embeddings=self.num_embeddings, 
-            seq_len=seq_len, 
-            batch_size=batch_size,
         )
-        if self.mode == 1:
+        
+        if self.mode == RelPosEmbsChoices.two_embedders:
+            assert self.positional_embeddings_k.weight.device == self.positional_embeddings_v.weight.device
+
+            positions = positions.to(self.positional_embeddings_k.weight.device)
             k = self.positional_embeddings_k(positions)
             v = self.positional_embeddings_v(positions)
             return k, v
-        if self.mode == 2:
+        if self.mode == RelPosEmbsChoices.one_embedder:
+            positions = positions.to(self.positional_embeddings.weight.device)
             shared = self.positional_embeddings(positions)
-            k = self.positional_embeddings_k(shared)
-            v = self.positional_embeddings_v(shared)
+            k = self.positional_embeddings_linear_k(shared)
+            v = self.positional_embeddings_linear_v(shared)
             return k, v
         else:
             raise ValueError("mode must be 1 or 2")
@@ -437,7 +502,7 @@ class RelAttBartDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
 
-        outputs = (hidden_states,)
+        outputs: tuple[torch.Tensor, ...] = (hidden_states,)
 
         if output_attentions:
             outputs += (self_attn_weights, cross_attn_weights)
@@ -446,3 +511,43 @@ class RelAttBartDecoderLayer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
+
+if __name__ == "__main__":
+    NUM_EMBEDDINGS = 64
+    SEQ_LEN = 190
+    BATCH_SIZE = 256
+    PROB = 0.5
+    N = 100
+
+    dims = (BATCH_SIZE, SEQ_LEN)
+    
+
+    def build_args():
+        attention_mask = (torch.rand(*dims) < PROB).cuda()
+        return dict(
+            attention_mask=attention_mask,
+            num_embeddings=NUM_EMBEDDINGS,
+        )
+
+    speeds_not_jitted = []
+    for i in range(N):
+        args = build_args()
+        start = time.perf_counter()
+        res_test = _build_rel_att_mat_test(**args)
+        speeds_not_jitted.append(time.perf_counter() - start)
+    print(f"Not jitted: {np.mean(speeds_not_jitted)}")
+
+    jitted = torch.jit.script(_build_rel_att_mat_test)
+    speeds_jitted = []
+    for i in range(N):
+        args = build_args()
+        start = time.perf_counter()
+        res_test = jitted(**args)
+        speeds_jitted.append(time.perf_counter() - start)
+    print(f"Jitted: {np.mean(speeds_jitted)}")
+
+
+    start = time.perf_counter()
+    res_ref = _build_rel_att_mat_ref(**args)
+    print("ref", time.perf_counter() - start)
+    assert torch.allclose(res_ref, res_test)

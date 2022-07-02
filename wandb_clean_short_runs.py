@@ -1,5 +1,5 @@
 """
-Deletes runs that are under a certain duration or that don't have a recorded duration at all.
+Deletes wandb runs that are under a certain duration or that don't have a recorded duration at all.
 """
 import datetime
 

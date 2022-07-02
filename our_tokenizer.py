@@ -47,8 +47,8 @@ class Tokenizer:
     def encode(
         self,
         input_str: str,
-        return_tensors: Optional[str] = "np",
         *,
+        return_tensors: Optional[str] = "np",
         no_eos: bool = False,
         strip_special_symbols: bool = False,
     ) -> Union[np.ndarray, torch.Tensor, list]:
@@ -83,9 +83,7 @@ class Tokenizer:
 
     def decode(self, input_tokens: List[int], ignore_special_symbols: bool) -> str:
 
-        if isinstance(input_tokens, torch.Tensor):
-            input_tokens = input_tokens.detach().cpu().numpy().tolist()
-        elif isinstance(input_tokens, np.ndarray):
+        if isinstance(input_tokens, (torch.Tensor,np. ndarray)):
             input_tokens = input_tokens.tolist()
 
         output = []
@@ -113,7 +111,8 @@ class Tokenizer:
         max_length: int,
         pad_to_multiple_of: bool,
         return_tensors: str = "np",
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, torch.Tensor], Dict[str, list[int]]]:
+        ignore_keys: list[str] = None,
+    ) -> Union[Dict[str, np.ndarray], Dict[str, torch.Tensor], Dict[str, list[int]]]:
         """Pad input_token_ids, create attention_mask, convert everything to tensors.
         Mirrors huggingface tokenizers that way.
         """
@@ -141,24 +140,24 @@ class Tokenizer:
             padded_sequences.append(seq)
 
         keys = padded_sequences[0].keys()
-        for padded_seq in padded_sequences[1:]:
-            as_set = set(padded_seq.keys())
-            assert as_set == keys, as_set
-
+        
+        if ignore_keys:
+            keys = {x for x in keys if x not in ignore_keys}
+            
         if return_tensors == "np":
-            output = {}
+            output_np = {}
             for k in keys:
                 seq = [x[k] for x in padded_sequences]
-                output[k] = np.array(seq, dtype=np.int64)
+                output_np[k] = np.array(seq, dtype=np.int64)
 
-            return output
+            return output_np
 
         elif return_tensors == "pt":
-            output = {}
+            output_torch = {}
             for k in keys:
                 seq = [x[k] for x in padded_sequences]
-                output[k] = torch.tensor(seq, dtype=torch.int64)
-            return output
+                output_torch[k] = torch.tensor(seq, dtype=torch.int64)
+            return output_torch
 
         elif return_tensors is None:
             return {

@@ -15,15 +15,15 @@ import time
 
 
 from beartype import beartype
-import pretty_traceback
+import pretty_traceback  # type: ignore
 
 pretty_traceback.install()
-import fire
-import nltk
+import fire  # type: ignore
+import nltk  # type: ignore
 import numpy as np
 import random
 import rich
-from tqdm import tqdm
+from tqdm import tqdm  # type: ignore
 import orjson as json
 
 import utils
@@ -111,14 +111,19 @@ def prep_input_data(
     input_str: str,
     pseudo_without_head: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    input_ids = tokenizer.encode(input_str, "np", no_eos=False)
-    decoder_input_ids = tokenizer.encode(pseudo_without_head, "np", no_eos=False)
+    input_ids = tokenizer(input_str, return_tensors="np", no_eos=False)
+    decoder_input_ids = tokenizer(pseudo_without_head, return_tensors="np", no_eos=False)
+
+    # The following is to silence type checkers. Only done once, it's ok.
+    assert isinstance(input_ids, np.ndarray), type(input_ids)  
+    assert isinstance(decoder_input_ids, np.ndarray), type(decoder_input_ids)
+
     return input_ids, decoder_input_ids
 
 
 def load_dataset(
     json_path: str, pkl_path: str
-) -> Tuple[DefaultDict[str, DefaultDict[int, "Node"]], "NestedClacConfig"]:
+) -> Tuple[DefaultDict[str, DefaultDict[int, list["Node"]]], "EquationConfig"]:
     LOGGER.debug(f"Reading and parsing dataset from {json_path} or from {pkl_path}")
 
     dicts: dict[str, Any]
@@ -135,7 +140,7 @@ def load_dataset(
 
     LOGGER.debug(f"Parsing structures from the dicts.")
     config = dicts["config"]
-    config_obj = NestedClacConfig.from_json_dict(config)
+    config_obj = EquationConfig.from_json_dict(config)
 
     data = dicts["data"]
 
@@ -206,7 +211,7 @@ class Node:
         complexity_level: int,
     ):
         self._op: Optional[str] = op
-        self._children: List["Node"] = children
+        self._children: List["Node"] = [] if children is None else children
         self._value = str(value)
         self._input_str: Optional[str] = None
         self._oracle_str: Optional[str] = None
@@ -217,9 +222,11 @@ class Node:
 
     def get_complexity_level(self) -> int:
         assert self._complexity_level is not None, "Complexity level is not set."
+        assert isinstance(self._complexity_level, int), type(self._complexity_level)
         return self._complexity_level
 
     def get_root_complexity_level(self) -> int:
+        assert isinstance(self._root_complexity_level, int), type(self._root_complexity_level)
         return self._root_complexity_level
 
     def set_complexity_level(self, value: int) -> None:
@@ -251,6 +258,16 @@ class Node:
             "complexity_level": self.get_complexity_level(),
             "root_complexity_level": self.get_root_complexity_level(),
         }
+    
+    def get_ident(self) -> str:
+        """ Return a unique identifyer.
+        `input_str`s are unique identifiers and always should be. 
+        The only preoccupation is the efficiency of the equality funciton. We'll 
+        see about that but it shouldn't be too bad.
+        `Node` objects cache their get_input_str, it's not lazily computed, so 
+        that part is pretty fast. 
+        """
+        return self.get_input_str()
 
     @classmethod
     def from_json_dict(cls, json_dict) -> "Node":
@@ -274,9 +291,10 @@ class Node:
         return node
 
     def get_op(self) -> str:
+        assert isinstance(self._op, str)
         return self._op
 
-    def get_children(self) -> Optional[list["Node"]]:
+    def get_children(self) -> list["Node"]:
         return self._children
 
     def get_value(self) -> str:
@@ -355,6 +373,8 @@ class Node:
     def get_pseudo_value(self) -> str:
         if not self.get_children():
             return self.get_value()
+        
+        assert isinstance(self._pseudo_value, str), type(self._pseudo_value)
         return self._pseudo_value
 
     def get_pseudo(
@@ -455,19 +475,22 @@ class Node:
             if head_type == "pred":
                 maybe_head_tokens = [-100] * len(potential_head) + [-100]
             elif head_type == "oracle":
-                maybe_head_tokens = potential_head + tokenizer(")", None, no_eos=True)
+                tokenized = tokenizer(")", return_tensors=None, no_eos=True)
+                assert isinstance(tokenized, list), type(tokenized)
+                assert isinstance(potential_head, list), type(potential_head)
+                maybe_head_tokens = potential_head + tokenized
             else:
                 raise ValueError(f"Unknown head_type: {head_type}")
 
             if head_type == "oracle":
-                equal_token_ids = tokenizer("=", None, no_eos=True)
+                equal_token_ids = tokenizer("=", return_tensors=None, no_eos=True)
             else:
-                equal_token_ids = len(tokenizer("=", None, no_eos=True)) * [-100]
+                equal_token_ids = len(tokenizer("=", return_tensors=None, no_eos=True)) * [-100]
 
             masked_pseudo = (
-                len(tokenizer("(", None, no_eos=True)) * [-100]
+                len(tokenizer("(", return_tensors=None, no_eos=True)) * [-100]
                 + masked_pseudo_a
-                + len(tokenizer(self.get_op(), None, no_eos=True)) * [-100]
+                + len(tokenizer(self.get_op(), return_tensors=None, no_eos=True)) * [-100]
                 + masked_pseudo_b
                 + equal_token_ids
                 + maybe_head_tokens
@@ -480,7 +503,7 @@ class Node:
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             pseudo_str = f"{self.get_value()}"
             pseudo_without_head = f""
-            masked_pseudo = [-100] * len(tokenizer(pseudo_str, None, no_eos=True))
+            masked_pseudo = [-100] * len(tokenizer(pseudo_str, return_tensors=None, no_eos=True))
 
         assert isinstance(pseudo_str, str), type(pseudo_str)
         assert isinstance(pseudo_without_head, str), type(pseudo_without_head)
@@ -499,7 +522,7 @@ def generate(
     complexity_level: int,
     name: str = "",
     filter_lambda: Optional[Callable] = None,
-) -> "Node":
+) -> Generator["Node", None, None]:
     """
     qty_each_op is per direction
     """
@@ -522,8 +545,10 @@ def generate(
                     value=opmap[op](a.get_value(), b.get_value()),
                     complexity_level=complexity_level,
                 )
-
-                if filter_lambda(new_node):
+                if filter_lambda is not None:
+                    if filter_lambda(new_node):
+                        yield new_node
+                else:
                     yield new_node
 
         return
@@ -585,7 +610,10 @@ def generate(
                 )
                 uniqe_roots.append(new_node)
 
-            yield from filter(filter_lambda, uniqe_roots)
+            if filter_lambda is not None:
+                yield from filter(filter_lambda, uniqe_roots)
+            else:
+                yield from uniqe_roots
 
 
 @beartype
@@ -597,7 +625,7 @@ def filter_length(
 ) -> bool:
 
     complete_str = root.get_oracle_str()[0]
-    complete_tokens = tokenizer(complete_str, None, no_eos=True)
+    complete_tokens = tokenizer(complete_str, return_tensors=None, no_eos=True)
 
     # Check complete length
     if max_len_total is not None and len(complete_tokens) > max_len_total:
@@ -609,7 +637,7 @@ def filter_length(
 
     for node in get_all_desc(root):
         answer = node.get_value()
-        answer_tokens = tokenizer(answer, None, no_eos=True)
+        answer_tokens = tokenizer(answer, return_tensors=None, no_eos=True)
         if len(answer_tokens) > max_len_answer:
             return False
 
@@ -689,8 +717,8 @@ def first_level_and_more(
 
 
 def generate_data(
-    config: "NestedClacConfig",
-) -> Tuple[List[Node], List[Node], List[Node]]:
+    config: "EquationConfig",
+) -> dict[str, dict[int, Any]]:
     tokenizer = our_tokenizer.ArithmeticTokenizer()
     filter_length_lambda = FilterLengthFunctor(
         config.max_answer_length, config.max_total_length, tokenizer
@@ -793,7 +821,7 @@ class PredLogger:
             rich.print(f"[bright_cyan]Level {k}[/]: {v.compute()}")
 
 
-class NestedClacConfig:
+class EquationConfig:
     # misc
 
     def __init__(
@@ -830,7 +858,7 @@ class NestedClacConfig:
         return base_dict
 
     @classmethod
-    def from_json_dict(cls, json_dict) -> "NestedClacConfig":
+    def from_json_dict(cls, json_dict) -> "EquationConfig":
 
         json_dict["operators"] = set(json_dict["operators"])
 
@@ -862,7 +890,7 @@ def main():
     # create basic config for logging
     logging.basicConfig(level=logging.DEBUG)
 
-    config = NestedClacConfig(
+    config = EquationConfig(
         max_depth=6,
         max_total_length=349,
         max_answer_length=6,
