@@ -4,6 +4,7 @@ from beartype.typing import *
 import collections
 import dataclasses
 import graphlib
+import inspect  # Only used for tests
 import itertools
 import logging
 import math
@@ -1029,13 +1030,20 @@ def main(
     abs_pos_embs_mode=modded_bart.AbsPosEmbsModes.learned_pos_embs,
     rel_pos_embs_mode=bart_rel_att.RelPosEmbsChoices.no_rel_pos_embs,
     num_rel_pos_embs=64,
+    max_epochs=100,
+
+    ###########################################################################
+    # Things to handle resuming
+    ###########################################################################
+    checkpoints_folder="/home/mila/g/gagnonju/SelfLearnedExplanations/log_results/checkpoints/",
+    wandb_info_file="/home/mila/g/gagnonju/SelfLearnedExplanations/log_results/wandb_info.json",
 
     ###########################################################################
     # Changes often
     ###########################################################################
     seed=453345,
     freeform_options=[True, False],
-    dataset_type=our_datasets.DatasetTypesChoices.oracle_basic_dataset,
+    dataset_type=our_datasets.DatasetTypesChoices.most_basic_dataset,
     max_level_training=6,
     do_log_results=True,
     path_log_results="log_results/lel.txt",
@@ -1053,6 +1061,13 @@ def main(
     n_layers=2,
     n_heads=4,
 ):
+    all_arguments = locals().copy()
+    # Inspect is only used for a test
+    assert all_arguments.keys() == inspect.signature(main).parameters.keys()
+
+    wandb_info_file: Final[Path] = Path(wandb_info_file)
+    checkpoints_folder: Final[Path] = Path(checkpoints_folder)
+
     ###########################################################################
     # Set the seeds
     ###########################################################################
@@ -1074,23 +1089,11 @@ def main(
 
     rich.print(f"Run name: [green]'{run_name}'\n")
 
+
+    max_len = len(max(all_arguments, key=lambda k: len(str(all_arguments[k])))) + 3
     rich.print(
         "Parsed execution arguments:\n",
-        f"\t- {data_name = }\n"
-        f"\t- {inf_num = }\n"
-
-        f"\t- {abs_pos_embs_mode = }\n"
-        f"\t- {rel_pos_embs_mode = }\n"
-        f"\t- {num_rel_pos_embs = }\n"
-        
-        f"\t- {freeform_options = }\n"
-        f"\t- {dataset_type = }\n"
-        f"\t- {max_level_training = }\n"
-        
-        f"\t- {batch_size = }\n"
-        f"\t- {h_size = }\n"
-        f"\t- {n_layers = }\n"
-        f"\t- {n_heads = }\n",
+        *[f"\t- {k} =" + (max_len - len(k)) * " " + f" {v}\n" for k, v in all_arguments.items()]
     )
 
     if do_log_results:
@@ -1166,6 +1169,13 @@ def main(
         num_rel_pos_embs=num_rel_pos_embs,
     )
 
+    if checkpoints_folder.glob("*.pt"):
+        checkpoint = torch.load(checkpoints_folder / "latest.pt")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        np.random.set_state(checkpoint["np_random_state"])
+        torch.random.set_rng_state(checkpoint["torch_random_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
     assert type(train_torch_dataset) == type(valid_torch_dataset), (
         type(train_torch_dataset),
         type(valid_torch_dataset),
@@ -1175,13 +1185,13 @@ def main(
     if isinstance(
         train_torch_dataset, our_datasets.SelfLearnedBasicDataset
     ) and isinstance(valid_torch_dataset, our_datasets.SelfLearnedBasicDataset):
+    
         train_torch_dataset.set_conc_mode(CONC_MODE)
         valid_torch_dataset.set_conc_mode(CONC_MODE)
         train_torch_dataset.set_mask_intermediate_labels(True)
         valid_torch_dataset.set_mask_intermediate_labels(True)
 
         assert CONC_MODE in ["yield", "top_sort"], CONC_MODE
-
 
     eval_batch_size = batch_size * 4
     pl_object = _PLBart(
@@ -1207,6 +1217,22 @@ def main(
         path_log_results=path_log_results,
     )
 
+    ###############################################################
+    # Handle resuming the Wandb run
+    ###############################################################
+    if wandb_info_file.exists():
+        with wandb_info_file.open() as f:
+            run_id = json.load(f)["run_id"]
+    else:
+        run_id = None
+    if run_id:
+        rich.print("[red bold]Resuming Wandb run:", run_id)
+        wandb.init(project=WANDB_PROJECT, resume="must", id=run_id)
+        assert wandb.run.resumed, wandb.run.resumed
+        assert wandb.run.project == WANDB_PROJECT, (wandb.run.project, WANDB_PROJECT)
+        assert wandb.run.id == run_id, (wandb.run.id, run_id)
+        assert wandb.run.name == run_name, (wandb.run.name, run_name)
+
     logger = pl.loggers.WandbLogger(
         project=WANDB_PROJECT,
         name=run_name,
@@ -1229,11 +1255,16 @@ def main(
     )
     wandb.run.log_code(SCRIPT_DIR)
 
+    if run_id is None:
+        with wandb_info_file.open("w") as f:
+            json.dump({"run_id": wandb.run.id}, f)
+        run_id = wandb.run.id
+
     trainer = pl.Trainer(
         logger=logger,
         gradient_clip_val=GRADIENT_CLIP_VAL,
         precision=PRECISION,
-        max_epochs=1000,
+        max_epochs=max_epochs,
         gpus=NUM_GPUS,
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
         limit_val_batches=NUM_SAMPLES_VALID // eval_batch_size,

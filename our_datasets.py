@@ -22,19 +22,20 @@ class MostBasicDataset(torch.utils.data.Dataset):
         dataset: Dict[str, List[datagen.Node]],
         tokenizer: our_tokenizer.Tokenizer,
     ):
-        self.dataset: list[datagen.Node] = sum(dataset.values(), [])
-        random.shuffle(self.dataset)
-        self.tokenizer = tokenizer
+        self._dataset: list[datagen.Node] = sum(dataset.values(), [])
+        random.shuffle(self._dataset)
+        self._tokenizer = tokenizer
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self._dataset)
 
     def __getitem__(self, idx: int):
-        input_ = self.dataset[idx].get_input_str()
-        label = str(self.dataset[idx].get_value())
+        input_ = self._dataset[idx].get_input_str()
+        label = str(self._dataset[idx].get_value())
         return dict(
-            input_ids=self.tokenizer(input_),
-            labels=self.tokenizer(label),
+            input_ids=self._tokenizer(input_),
+            labels=self._tokenizer(label),
+            idents=self._dataset[idx].get_ident(),
         )
 
 
