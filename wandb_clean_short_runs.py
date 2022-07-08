@@ -4,14 +4,13 @@ Deletes wandb runs that are under a certain duration or that don't have a record
 import datetime
 
 from typing import *
-import pretty_traceback
+import pretty_traceback  # type: ignore
 import rich
 import rich.table
 import wandb
 
+
 pretty_traceback.install()
-
-
 FILL_CHAR = " "
 NORMALIZED_LEN = 2
 NUM_MINUTES_TO_KEEP = 30
@@ -26,10 +25,10 @@ def parse_time(seconds: int) -> Tuple[int, int, int]:
 
 
 def len_normalize_num_str(num: int, target_l: int, fill_char: str) -> str:
-    num = str(num)
-    if len(num) < target_l:
-        num = (target_l - len(num)) * fill_char + num
-    return num
+    str_num = str(num)
+    if len(str_num) < target_l:
+        str_num = (target_l - len(str_num)) * fill_char + str_num
+    return str_num
 
 
 def main():

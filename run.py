@@ -18,12 +18,12 @@ from pathlib import Path
 import re
 import sys
 
-import fire
-import jstyleson
-import pretty_traceback
+import fire  # type: ignore[import]
+import jstyleson  # type: ignore[import]
+import pretty_traceback  # type: ignore[import]
+import rich
 
 pretty_traceback.install()
-import rich
 
 
 SCRIPT_DIR = Path(__file__).absolute().parent

@@ -19,7 +19,7 @@ import torch
 import transformers
 import transformers.models.bart.modeling_bart as modeling_bart
 
-import datagen
+import data_generation_arithmetic
 
 
 def _pad_batch_of_sequences_from_dict(
@@ -127,7 +127,7 @@ class DataCollatorWithDecoderInputIds:
         assert "input_ids" in keys
         DECODER_PAD_DIRECTION = "left"
 
-        levels = datagen.tree_depth_from_ids_batch(
+        levels = data_generation_arithmetic.tree_depth_from_ids_batch(
             [x["input_ids"] for x in features], self._tokenizer
         )
         print("In collator")

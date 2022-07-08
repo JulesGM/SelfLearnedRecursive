@@ -1,4 +1,5 @@
 print("Importing modules.")
+
 from beartype.typing import *
 
 import collections
@@ -24,19 +25,23 @@ import torch
 from tqdm import tqdm  # type: ignore
 import transformers
 
-import ujson as json
+try:
+    import ujson as json
+except ImportError:
+    import json  # type: ignore[no-redef]
+    
 import wandb
 
 import pretty_traceback  # type: ignore
 pretty_traceback.install()
 
-import bart_rel_att
-import datagen
+import bart_relative_attention
+import data_generation_arithmetic
 import our_data_collator
 import our_datasets
 import our_metrics
 import our_tokenizer
-import modded_bart
+import bart_modified
 import utils
 print("Done loading modules.\n")
 
@@ -56,6 +61,7 @@ class ValidModes:
 ACTIVE_MODES = {ValidModes.per_batch}
 NUM_SAMPLES_VALID = 20000
 EVAL_EVERY_N_EPOCHS = 1
+DETERMINISTIC = True
 
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0
@@ -82,7 +88,7 @@ DATA_PATH = SCRIPT_DIR / "data"
 
 
 def generate(model: transformers.PreTrainedModel, **kwargs):
-    assert isinstance(model, modded_bart.ModifiedBartForConditionalGeneration), "only type currently supported"
+    assert isinstance(model, bart_modified.ModifiedBartForConditionalGeneration), "only type currently supported"
 
     for k in GENERATION_KWARGS.keys():
         assert GENERATION_KWARGS[k] == kwargs[k], f"{k} mismatch"
@@ -176,7 +182,7 @@ class RenewableGenerator:
 
 def top_sort_build_tree(
     dep_dict: dict, 
-    visited_datagen: datagen.Node
+    visited_datagen: data_generation_arithmetic.Node
 ):
     if visited_datagen.get_children():
         dep_dict[visited_datagen] = []
@@ -263,6 +269,7 @@ class _PLBart(pl.LightningModule):
         max_depth: int,
         do_log_results: bool,
         path_log_results: Path,
+        extra_info_file: Path,
     ):
         super().__init__()
         self._model: transformers.PreTrainedModel = model
@@ -274,7 +281,8 @@ class _PLBart(pl.LightningModule):
             prog_bar=True, on_step=True, on_epoch=True, logger=True
         )
         self._freeform_options: Final[set[bool]] = freeform_options
-        
+        self._extra_info_file: Final[Path] = extra_info_file
+
         ################################################################################
         # Related to datasets
         ################################################################################
@@ -333,6 +341,15 @@ class _PLBart(pl.LightningModule):
                     2: 1.0,
                 }
             )
+
+    def on_train_epoch_end(self) -> None:
+        with self._extra_info_file.open("w") as f:
+            json.dump(dict(  # type: ignore[call-arg]
+                torch_rng_state=torch.random.get_rng_state(),
+                numpy_rng_state=np.random.get_state(),
+                python_rng_state=random.getstate(),
+                wandb_run_id=wandb.run.id,
+            ), f, default=json_dumper_default)
 
     def forward(self, **kwargs):
         if "decoder_input_ids_for_gen" in kwargs:
@@ -597,7 +614,7 @@ class _PLBart(pl.LightningModule):
                     if not (mode == ValidModes.per_sample and is_freeform):
                         # TODO: This is slow but it is precise.
                         
-                        level = datagen.tree_depth_from_ids(sample["input_ids"], self._tokenizer)
+                        level = data_generation_arithmetic.tree_depth_from_ids(sample["input_ids"], self._tokenizer)
                         big_counter.append(level)
 
                         assert level > 0, level
@@ -672,7 +689,7 @@ class _PLBart(pl.LightningModule):
         self._model = self._model.train()  # type: ignore[no-redef]
 
     def on_validation_epoch_end(self) -> None:
-        with jsonl.open(self._path_log_results, "a", dumps=lambda x: json.dumps(x, allow_nan=False, default=json_dumper_default)) as f:
+        with jsonl.open(self._path_log_results, "a", dumps=lambda x: json.dumps(x, allow_nan=False, default=json_dumper_default)) as f:  # type: ignore[call-arg]
             f.write(dict(
                 epoch=self.current_epoch,
                 results=self._results_to_log,
@@ -694,6 +711,7 @@ class _PLBart(pl.LightningModule):
             self.parameters(),
             lr=self._learning_rate,
             weight_decay=self._weight_decay,
+            capturable=True,
         )
 
         output = dict(optimizer=optimizer)
@@ -1019,34 +1037,46 @@ class _PLBart(pl.LightningModule):
                 return_ids=True,
             )
 
+def get_last_checkpoint_path(checkpoints_folder, wandb_run_id):
+    rich.print(f"[red bold]{wandb_run_id = }")
+    checkpoint_files = list(checkpoints_folder.glob("**/*.ckpt"))
+    assert len(checkpoint_files) == 1, checkpoint_files
+    checkpoints = list((checkpoints_folder / WANDB_PROJECT / wandb_run_id / "checkpoints").glob("*.ckpt"))
+    assert len(checkpoints) == 1, checkpoints
+    checkpoint_path = checkpoints[0]
+    rich.print(f"[red bold]{checkpoint_path = }")
+    return checkpoint_path
+    
+
+DEFAULT_SAVE_DIR = SCRIPT_DIR / "log_results/test_bench/"
 
 
 def main(
     ###########################################################################
     # Should not change
     ###########################################################################
-    data_name="349_6_6_10000.json.pkl",    
+    data_name="349_6_6_200000.json.pkl",    
     inf_num=6,
-    abs_pos_embs_mode=modded_bart.AbsPosEmbsModes.learned_pos_embs,
-    rel_pos_embs_mode=bart_rel_att.RelPosEmbsChoices.no_rel_pos_embs,
+    abs_pos_embs_mode=bart_modified.AbsPosEmbsModes.learned_pos_embs,
+    rel_pos_embs_mode=bart_relative_attention.RelPosEmbsChoices.no_rel_pos_embs,
     num_rel_pos_embs=64,
     max_epochs=100,
 
     ###########################################################################
     # Things to handle resuming
     ###########################################################################
-    checkpoints_folder="/home/mila/g/gagnonju/SelfLearnedExplanations/log_results/checkpoints/",
-    wandb_info_file="/home/mila/g/gagnonju/SelfLearnedExplanations/log_results/wandb_info.json",
+    checkpoints_folder=DEFAULT_SAVE_DIR / "checkpoints/",
+    extra_info_file=DEFAULT_SAVE_DIR / "extra_info.json",
 
     ###########################################################################
     # Changes often
     ###########################################################################
     seed=453345,
     freeform_options=[True, False],
-    dataset_type=our_datasets.DatasetTypesChoices.most_basic_dataset,
+    dataset_type=our_datasets.DatasetTypesChoices.oracle_basic_dataset,
     max_level_training=6,
     do_log_results=True,
-    path_log_results="log_results/lel.txt",
+    path_log_results=DEFAULT_SAVE_DIR / "results.json",
 
     ###########################################################################
     # Changes with model size
@@ -1065,51 +1095,85 @@ def main(
     # Inspect is only used for a test
     assert all_arguments.keys() == inspect.signature(main).parameters.keys()
 
-    wandb_info_file: Final[Path] = Path(wandb_info_file)
+    extra_info_file: Final[Path] = Path(extra_info_file)
     checkpoints_folder: Final[Path] = Path(checkpoints_folder)
+
+    if extra_info_file.exists():
+        with extra_info_file.open() as f:
+            wandb_run_id = json.load(f)["wandb_run_id"]
+        path_last_checkpoint = get_last_checkpoint_path(checkpoints_folder, wandb_run_id)
+        assert path_last_checkpoint.exists() == extra_info_file.exists(), (
+            f"\n\t- {path_last_checkpoint.exists()}: {path_last_checkpoint}"
+            f"\n\t- {extra_info_file.exists()}: {extra_info_file}"
+        )
+    resuming = extra_info_file.exists()
+
 
     ###########################################################################
     # Set the seeds
     ###########################################################################
+    torch.use_deterministic_algorithms(mode=DETERMINISTIC)
     torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(mode=True)
     random.seed(seed)
     np.random.seed(seed)
 
+    ###############################################################
+    # Handle resuming the Wandb run & setting the seeds
+    ###############################################################
     if dataset_type == our_datasets.DatasetTypesChoices.most_basic_dataset:
         ds_str = "most_basic"
     elif dataset_type == our_datasets.DatasetTypesChoices.oracle_basic_dataset:
         ds_str = "oracle"
     else:
         raise ValueError("Unknown dataset type")
-    
+
     fix_str = f"abs_pe_{abs_pos_embs_mode}"
     rel_str = f"rel_pe_{rel_pos_embs_mode}_{num_rel_pos_embs}_" if rel_pos_embs_mode else ""
     run_name = f"{rel_str}{fix_str}_trained_{max_level_training}_inf_{inf_num}_{ds_str}" # "_h_size_{h_size}_n_layers_{n_layers}_n_heads_{n_heads}"
+    
+    if resuming:
+        with extra_info_file.open() as f:
+            extra_info = json.load(f)
+            wandb_run_id = extra_info["wandb_run_id"]
+            torch.random.set_rng_state(torch.ByteTensor(extra_info["torch_rng_state"]))
+            np.random.set_state(extra_info["numpy_rng_state"])
+
+            for i, v in enumerate(extra_info["python_rng_state"]):
+                if isinstance(v, list):
+                    extra_info["python_rng_state"][i] = tuple(extra_info["python_rng_state"][i])
+
+            random.setstate(tuple(extra_info["python_rng_state"]))
+
+        rich.print("[red bold]Resuming Wandb run:", wandb_run_id)
+        wandb.init(project=WANDB_PROJECT, resume="must", id=wandb_run_id)
+
+        assert wandb.run.resumed, wandb.run.resumed
+        assert wandb.run.project == WANDB_PROJECT, (wandb.run.project, WANDB_PROJECT)
+        assert wandb.run.id == wandb_run_id, (wandb.run.id, wandb_run_id)
+
+    else:
+        extra_info = None       
+        wandb_run_id = None
+
 
     rich.print(f"Run name: [green]'{run_name}'\n")
-
-
-    max_len = len(max(all_arguments, key=lambda k: len(str(all_arguments[k])))) + 3
-    rich.print(
-        "Parsed execution arguments:\n",
-        *[f"\t- {k} =" + (max_len - len(k)) * " " + f" {v}\n" for k, v in all_arguments.items()]
-    )
+    utils.print_dict(all_arguments)
 
     if do_log_results:
         path_log_results = Path(path_log_results)
-        assert not path_log_results.exists(), f"'{path_log_results}' already exists."
-
+        if path_log_results.exists():
+            assert resuming, f"The log file already exists, but we are not resuming: {path_log_results}"
+        
     assert dataset_type in our_datasets.DATASET_TYPES, dataset_type
     assert freeform_options, freeform_options
     assert isinstance(freeform_options, (list, tuple, set)), freeform_options
     assert all(isinstance(x, bool) for x in freeform_options)
 
-    dataset, dataset_config = datagen.load_dataset(None, DATA_PATH / data_name)
+    dataset, dataset_config = data_generation_arithmetic.load_dataset(None, DATA_PATH / data_name)
     rich.print(vars(dataset_config))
     
-    train_ds : Dict[int, datagen.Node] = dataset["train"]
-    valid_ds : Dict[int, datagen.Node] = dataset["eval"]
+    train_ds : Dict[int, data_generation_arithmetic.Node] = dataset["train"]
+    valid_ds : Dict[int, data_generation_arithmetic.Node] = dataset["eval"]
     assert len(train_ds) == inf_num, (len(train_ds), inf_num)
 
     if max_level_training:
@@ -1162,19 +1226,12 @@ def main(
 
     # The only difference is that we take decoder_attention_masks into account
     # for positional embeddings
-    model = modded_bart.ModifiedBartForConditionalGeneration(
+    model = bart_modified.ModifiedBartForConditionalGeneration(
         config, 
         abs_pos_embs_mode=abs_pos_embs_mode,
         rel_pos_embs_mode=rel_pos_embs_mode,
         num_rel_pos_embs=num_rel_pos_embs,
     )
-
-    if checkpoints_folder.glob("*.pt"):
-        checkpoint = torch.load(checkpoints_folder / "latest.pt")
-        model.load_state_dict(checkpoint["model_state_dict"])
-        np.random.set_state(checkpoint["np_random_state"])
-        torch.random.set_rng_state(checkpoint["torch_random_state"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     assert type(train_torch_dataset) == type(valid_torch_dataset), (
         type(train_torch_dataset),
@@ -1185,7 +1242,7 @@ def main(
     if isinstance(
         train_torch_dataset, our_datasets.SelfLearnedBasicDataset
     ) and isinstance(valid_torch_dataset, our_datasets.SelfLearnedBasicDataset):
-    
+
         train_torch_dataset.set_conc_mode(CONC_MODE)
         valid_torch_dataset.set_conc_mode(CONC_MODE)
         train_torch_dataset.set_mask_intermediate_labels(True)
@@ -1211,28 +1268,12 @@ def main(
         # do_allen_nlp_predictions=False,
         max_total_length_gen=dataset_config.max_total_length,
         max_answer_gen=dataset_config.max_answer_length,
-        freeform_options=freeform_options,
         max_depth=dataset_config.max_depth,
         do_log_results=do_log_results,
         path_log_results=path_log_results,
+        extra_info_file=extra_info_file,
+        freeform_options=freeform_options,
     )
-
-    ###############################################################
-    # Handle resuming the Wandb run
-    ###############################################################
-    if wandb_info_file.exists():
-        with wandb_info_file.open() as f:
-            run_id = json.load(f)["run_id"]
-    else:
-        run_id = None
-    if run_id:
-        rich.print("[red bold]Resuming Wandb run:", run_id)
-        wandb.init(project=WANDB_PROJECT, resume="must", id=run_id)
-        assert wandb.run.resumed, wandb.run.resumed
-        assert wandb.run.project == WANDB_PROJECT, (wandb.run.project, WANDB_PROJECT)
-        assert wandb.run.id == run_id, (wandb.run.id, run_id)
-        assert wandb.run.name == run_name, (wandb.run.name, run_name)
-
     logger = pl.loggers.WandbLogger(
         project=WANDB_PROJECT,
         name=run_name,
@@ -1242,25 +1283,26 @@ def main(
             bart_config=vars(config),
             dataset_type=type(train_torch_dataset).__name__,
             eval_batch_size=eval_batch_size,
-            freeform_mode=list(freeform_options),
             generation_kwargs=GENERATION_KWARGS,
             learning_rate=LEARNING_RATE,
             num_gpus=NUM_GPUS,
             precision=PRECISION,
             train_batch_size=batch_size,
             max_level_training=max_level_training,
-            abs_pos_embs_mode=abs_pos_embs_mode,
-            rel_pos_embs_mode=rel_pos_embs_mode,
+            arguments=all_arguments,
         ),
     )
     wandb.run.log_code(SCRIPT_DIR)
 
-    if run_id is None:
-        with wandb_info_file.open("w") as f:
-            json.dump({"run_id": wandb.run.id}, f)
-        run_id = wandb.run.id
-
     trainer = pl.Trainer(
+        enable_checkpointing=pl.callbacks.ModelCheckpoint(
+            dirpath=checkpoints_folder,
+            every_n_epochs=1, 
+            save_on_train_epoch_end=True, 
+            save_last=True
+        ),
+        deterministic=DETERMINISTIC,
+        default_root_dir=checkpoints_folder,
         logger=logger,
         gradient_clip_val=GRADIENT_CLIP_VAL,
         precision=PRECISION,
@@ -1269,7 +1311,11 @@ def main(
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
         limit_val_batches=NUM_SAMPLES_VALID // eval_batch_size,
     )
-    trainer.fit(pl_object)
+    
+    if resuming:
+        trainer.fit(pl_object, ckpt_path=path_last_checkpoint)
+    else:
+        trainer.fit(pl_object)
 
 
 if __name__ == "__main__":

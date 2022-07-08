@@ -1,6 +1,15 @@
 import collections
 import itertools
 
+from beartype.typing import *
+import rich
+
+
+def print_dict(d: dict[str, Any]) -> None:
+    max_len = len(max(d, key=lambda k: len(str(d[k])))) + 3
+    for k, v in d.items():
+        rich.print(f"\t- {k} =" + (max_len - len(k)) * " " + f" {v}\n")
+
 
 def zip_dicts(*dicts):
     """
