@@ -5,12 +5,11 @@ from typing import *
 import time
 
 import numpy as np
-import rich
 import torch
 
 import data_generation_arithmetic
 
-import our_tokenizer
+import data_tokenizer
 
 
 class MostBasicDataset(torch.utils.data.Dataset):
@@ -20,7 +19,7 @@ class MostBasicDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         dataset: Dict[str, List[data_generation_arithmetic.Node]],
-        tokenizer: our_tokenizer.Tokenizer,
+        tokenizer: data_tokenizer.Tokenizer,
     ):
         self._dataset: list[data_generation_arithmetic.Node] = sum(dataset.values(), [])
         random.shuffle(self._dataset)
@@ -46,7 +45,7 @@ class OracleBasicDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         dataset: Dict[str, list[data_generation_arithmetic.Node]],
-        tokenizer: our_tokenizer.Tokenizer,
+        tokenizer: data_tokenizer.Tokenizer,
     ):
         self._tokenizer = tokenizer
         self._dataset: list[data_generation_arithmetic.Node] = sum(dataset.values(), [])
@@ -76,7 +75,7 @@ class SelfLearnedBasicDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         dataset: Dict[str, list[data_generation_arithmetic.Node]],
-        tokenizer: our_tokenizer.Tokenizer,
+        tokenizer: data_tokenizer.Tokenizer,
     ):
 
         self._dataset: list[data_generation_arithmetic.Node] = sum(dataset.values(), [])
@@ -161,7 +160,7 @@ class CurriculumSelfLearned(SelfLearnedBasicDataset):
     def __init__(
         self,
         dataset: Dict[str, List[data_generation_arithmetic.Node]],
-        tokenizer: our_tokenizer.Tokenizer,
+        tokenizer: data_tokenizer.Tokenizer,
     ):
         super().__init__(dataset, tokenizer)
         self._split_datasets = dataset
@@ -187,7 +186,3 @@ DATASET_TYPES = dict(
 )
 
 
-class DatasetTypesChoices:
-    most_basic_dataset = "most_basic_dataset"
-    oracle_basic_dataset = "oracle_basic_dataset"
-    self_learned_basic_dataset = "self_learned_basic_dataset"

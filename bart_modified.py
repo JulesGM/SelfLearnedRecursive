@@ -39,8 +39,7 @@ from torch import nn
 import transformers.models.bart.modeling_bart as original
 
 import bart_relative_attention
-
-
+import general_shared_constants
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +160,7 @@ class ModifiedBartEncoder(original.BartPretrainedModel):
     ):
         super().__init__(config)
 
-        assert abs_pos_embs_mode in AbsPosEmbsModes.__choices__, abs_pos_embs_mode
+        assert abs_pos_embs_mode in general_shared_constants.AbsPosEmbsModes.__choices__, abs_pos_embs_mode
 
         self.dropout = config.dropout
         self.layerdrop = config.encoder_layerdrop
@@ -188,19 +187,19 @@ class ModifiedBartEncoder(original.BartPretrainedModel):
         self.abs_embed_positions : Union[
             FixedPositionalEmbedding, ModifiedBartLearnedPositionalEmbedding, None
         ]
-        if abs_pos_embs_mode == AbsPosEmbsModes.fixed_pos_embs:
+        if abs_pos_embs_mode == general_shared_constants.AbsPosEmbsModes.fixed_pos_embs:
             self.abs_embed_positions = FixedPositionalEmbedding(
                 config.d_model,
             )
-        elif abs_pos_embs_mode == AbsPosEmbsModes.learned_pos_embs:
+        elif abs_pos_embs_mode == general_shared_constants.AbsPosEmbsModes.learned_pos_embs:
             self.abs_embed_positions = ModifiedBartLearnedPositionalEmbedding(
                 config.max_position_embeddings,
                 config.d_model,
             )
-        elif abs_pos_embs_mode == AbsPosEmbsModes.no_abs_pos_embs:
+        elif abs_pos_embs_mode == general_shared_constants.AbsPosEmbsModes.no_abs_pos_embs:
             self.abs_embed_positions = None
 
-        if rel_pos_embs_mode != bart_relative_attention.RelPosEmbsChoices.no_rel_pos_embs:
+        if rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
             self.layers = nn.ModuleList(
                 [bart_relative_attention.RelAttBartEncoderLayer(config) for _ in range(config.encoder_layers)]
             )
@@ -307,7 +306,7 @@ class ModifiedBartEncoder(original.BartPretrainedModel):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Modified by us
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        if self.rel_pos_embs_mode != bart_rel_att.RelPosEmbsChoices.no_rel_pos_embs:
+        if self.rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
             rel_att_keys, rel_att_values = self.rel_pos_embs(
                 attention_mask=attention_mask,
             )
@@ -364,7 +363,7 @@ class ModifiedBartEncoder(original.BartPretrainedModel):
                         output_attentions=output_attentions,
                     )
 
-                    if self.rel_pos_embs_mode != bart_rel_att.RelPosEmbsChoices.no_rel_pos_embs:
+                    if self.rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
                         encoder_layer_args["rel_att_keys"] = rel_att_keys
                         encoder_layer_args["rel_att_values"] = rel_att_values
                 
@@ -428,22 +427,22 @@ class ModifiedBartDecoder(original.BartDecoder):
         #     Added fixed positional embeddings.
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         AbsEmbedPosType = Optional[Union[FixedPositionalEmbedding, ModifiedBartLearnedPositionalEmbedding]]
-        if abs_pos_embs_mode == AbsPosEmbsModes.fixed_pos_embs:
+        if abs_pos_embs_mode == general_shared_constants.AbsPosEmbsModes.fixed_pos_embs:
             self.abs_embed_positions: AbsEmbedPosType = FixedPositionalEmbedding(  # type: ignore[no-redef]
                 config.d_model,
             ) 
 
-        elif abs_pos_embs_mode == AbsPosEmbsModes.learned_pos_embs:
+        elif abs_pos_embs_mode == general_shared_constants.AbsPosEmbsModes.learned_pos_embs:
             self.abs_embed_positions: AbsEmbedPosType = ModifiedBartLearnedPositionalEmbedding(  # type: ignore[no-redef]
                 config.max_position_embeddings,
                 config.d_model,
             )  
-        elif abs_pos_embs_mode == AbsPosEmbsModes.no_abs_pos_embs:
+        elif abs_pos_embs_mode == general_shared_constants.AbsPosEmbsModes.no_abs_pos_embs:
             self.abs_embed_positions: AbsEmbedPosType = None  # type: ignore[no-redef]
         else:
             raise ValueError(f"Unknown abs_pos_embs_mode: {abs_pos_embs_mode}")
 
-        if rel_pos_embs_mode != bart_relative_attention.RelPosEmbsChoices.no_rel_pos_embs:
+        if rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
             self.layers = nn.ModuleList(
                 [bart_relative_attention.RelAttBartDecoderLayer(config) for _ in range(config.decoder_layers)]
             )
@@ -687,7 +686,7 @@ class ModifiedBartDecoder(original.BartDecoder):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Modified by us
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        if self.rel_pos_embs_mode != bart_relative_attention.RelPosEmbsChoices.no_rel_pos_embs:
+        if self.rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
             rel_att_keys, rel_att_values = self.rel_pos_embs(
                 attention_mask=un_prepared_attention_mask,
             )
@@ -756,7 +755,7 @@ class ModifiedBartDecoder(original.BartDecoder):
                     use_cache=use_cache,
                 )
 
-                if self.rel_pos_embs_mode != bart_relative_attention.RelPosEmbsChoices.no_rel_pos_embs:
+                if self.rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
                     decoder_layer_args["rel_att_keys"] = rel_att_keys
                     decoder_layer_args["rel_att_values"] = rel_att_values
                 
@@ -807,16 +806,6 @@ class ModifiedBartDecoder(original.BartDecoder):
         )
 
 
-class AbsPosEmbsModes:
-    no_abs_pos_embs = "no_abs_pos_embs"
-    fixed_pos_embs = "fixed_pos_embs"
-    learned_pos_embs = "learned_pos_embs"
-    
-    __choices__ = {
-        no_abs_pos_embs, 
-        fixed_pos_embs,
-        learned_pos_embs,
-    }
 
 class ModifiedBartModel(original.BartModel):
     """
@@ -831,7 +820,7 @@ class ModifiedBartModel(original.BartModel):
         num_rel_pos_embs: int,
     ):
         original.BartPretrainedModel.__init__(self, config)
-        assert abs_pos_embs_mode in AbsPosEmbsModes.__choices__
+        assert abs_pos_embs_mode in general_shared_constants.AbsPosEmbsModes.__choices__
 
         padding_idx, vocab_size = config.pad_token_id, config.vocab_size
         self.shared = nn.Embedding(vocab_size, config.d_model, padding_idx)
@@ -1166,8 +1155,8 @@ def main(model=None):
     print("importing")
     import numpy as np
     import transformers
-    import our_tokenizer
-    import our_data_collator
+    import data_tokenizer
+    import data_collator
 
     print("done w imports")
 
@@ -1193,7 +1182,7 @@ def main(model=None):
     )
     assert torch.allclose(new, old)
 
-    tokenizer = our_tokenizer.Tokenizer()
+    tokenizer = data_tokenizer.Tokenizer()
 
     config = transformers.BartConfig.from_pretrained("facebook/bart-base")
     config.no_repeat_ngram_size = 0
@@ -1232,7 +1221,7 @@ def main(model=None):
     if model is None:
         model = ModifiedBartForConditionalGeneration(config).cuda().eval()
 
-    collator = our_data_collator.DataCollatorWithDecoderInputIds(
+    collator = data_collator.DataCollatorWithDecoderInputIds(
         tokenizer, model, 512, -100
     )
 

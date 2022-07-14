@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# coding: utf-8
+
 print("Importing modules.")
 
 from beartype.typing import *
@@ -17,6 +20,7 @@ import time
 from beartype import beartype
 import fire  # type: ignore
 import jsonlines as jsonl  # type: ignore
+import more_itertools
 import numpy as np
 import os
 import pytorch_lightning as pl
@@ -35,14 +39,15 @@ import wandb
 import pretty_traceback  # type: ignore
 pretty_traceback.install()
 
-import bart_relative_attention
-import data_generation_arithmetic
-import our_data_collator
-import our_datasets
-import our_metrics
-import our_tokenizer
 import bart_modified
-import utils
+import data_collator
+import data_datasets
+import data_tokenizer
+import data_generation_arithmetic
+import general_shared_constants
+import general_utils
+import our_metrics
+import script_data_subset_selection
 print("Done loading modules.\n")
 
 
@@ -250,12 +255,11 @@ class _PLBart(pl.LightningModule):
         self,
         *,
         model: transformers.PreTrainedModel,
-        tokenizer: our_tokenizer.Tokenizer,
+        tokenizer: data_tokenizer.Tokenizer,
         train_ds,
         eval_ds,
         train_batch_size: int,
         eval_batch_size: int,
-        num_workers_dl: int,
         generation_kwargs: dict[str, Any],
         learning_rate: float,
         is_adamw: bool,
@@ -288,7 +292,7 @@ class _PLBart(pl.LightningModule):
         ################################################################################
         # These things are defined in the dataset
         self._mask_intermediate_labels = isinstance(
-            train_ds, our_datasets.SelfLearnedBasicDataset
+            train_ds, data_datasets.SelfLearnedBasicDataset
         )
         self._max_depth: Final[int] = max_depth
         self._max_answer_gen: Final[int] = max_answer_gen
@@ -298,7 +302,6 @@ class _PLBart(pl.LightningModule):
         assert train_ds is not eval_ds, "train_ds and eval_ds must be different objects"
         self._train_ds: Final = train_ds
         self._eval_ds: Final = eval_ds
-        self._num_workers_dl: Final[int] = num_workers_dl
         
         ################################################################################
         # Rel. to logging results for answer overlap estim.
@@ -323,7 +326,7 @@ class _PLBart(pl.LightningModule):
         ), "the max length is computed dynamically"
 
     def on_train_epoch_start(self):
-        if isinstance(self._train_ds, our_datasets.CurriculumSelfLearned):
+        if isinstance(self._train_ds, data_datasets.CurriculumSelfLearned):
             self._train_ds.mix(
                 {
                     0: 1.0,
@@ -333,7 +336,7 @@ class _PLBart(pl.LightningModule):
             )
 
     def on_validation_start(self) -> None:
-        if isinstance(self._eval_ds, our_datasets.CurriculumSelfLearned):
+        if isinstance(self._eval_ds, data_datasets.CurriculumSelfLearned):
             self._eval_ds.mix(
                 {
                     0: 1.0,
@@ -451,7 +454,7 @@ class _PLBart(pl.LightningModule):
         big_counter = []
         preds: DefaultDict[str, dict[bool, dict[str, torch.Tensor]]] = collections.defaultdict(dict)
         for i, pack in enumerate(
-            tqdm(utils.zip_dicts(batch), desc="Validating", total=len(batch["input_ids"]))
+            tqdm(general_utils.zip_dicts(batch), desc="Validating", total=len(batch["input_ids"]))
         ):
 
             do_print = i < 5
@@ -533,10 +536,10 @@ class _PLBart(pl.LightningModule):
 
                     if self._eval_ds.has_decoder_input_ids_for_gen and not is_freeform:
                         clean_pred = clean_pred[
-                            utils.find_last(clean_pred, self._tokenizer.token_to_idx["="]) :
+                            general_utils.find_last(clean_pred, self._tokenizer.token_to_idx["="]) :
                         ]
                         clean_label = clean_label[
-                            utils.find_last(clean_label, self._tokenizer.token_to_idx["="]) :
+                            general_utils.find_last(clean_label, self._tokenizer.token_to_idx["="]) :
                         ]
 
                     if do_print:
@@ -967,9 +970,9 @@ class _PLBart(pl.LightningModule):
     def _make_regular_dataloader(
         self,
         ds: Union[
-            our_datasets.MostBasicDataset,
-            our_datasets.OracleBasicDataset,
-            our_datasets.SelfLearnedBasicDataset,
+            data_datasets.MostBasicDataset,
+            data_datasets.OracleBasicDataset,
+            data_datasets.SelfLearnedBasicDataset,
         ],
         batch_size: int,
         shuffle: bool,
@@ -977,7 +980,7 @@ class _PLBart(pl.LightningModule):
     ) -> torch.utils.data.DataLoader:
         return torch.utils.data.DataLoader(
             ds,
-            collate_fn=our_data_collator.DataCollatorWithDecoderInputIds(
+            collate_fn=data_collator.DataCollatorWithDecoderInputIds(
                 tokenizer=self._tokenizer,
                 model=self._model,
                 max_length=self._model.config.max_position_embeddings,
@@ -985,12 +988,12 @@ class _PLBart(pl.LightningModule):
                 return_idents=return_ids,
             ),
             batch_size=batch_size,
-            num_workers=self._num_workers_dl,
+            num_workers=0,
             shuffle=shuffle,
         )
 
     def train_dataloader(self):
-        if isinstance(self._train_ds, our_datasets.SelfLearnedBasicDataset):
+        if isinstance(self._train_ds, data_datasets.SelfLearnedBasicDataset):
             if self._train_ds.has_len():
                 num_batches = math.ceil(len(self._train_ds) / self._batch_size)
             else:
@@ -1014,7 +1017,7 @@ class _PLBart(pl.LightningModule):
             )
 
     def val_dataloader(self):
-        if isinstance(self._eval_ds, our_datasets.SelfLearnedBasicDataset):
+        if isinstance(self._eval_ds, data_datasets.SelfLearnedBasicDataset):
             if self._eval_ds.has_len():
                 num_batches = math.ceil(len(self._eval_ds) / self._batch_size)
             else:
@@ -1055,10 +1058,11 @@ def main(
     ###########################################################################
     # Should not change
     ###########################################################################
-    data_name="349_6_6_200000.json.pkl",    
+    data_name=                                          "349_6_6_200000.json.pkl",
+    subset_path="data/subsets/subset_10000_seed_453345_of_349_6_6_50000.json",
     inf_num=6,
-    abs_pos_embs_mode=bart_modified.AbsPosEmbsModes.learned_pos_embs,
-    rel_pos_embs_mode=bart_relative_attention.RelPosEmbsChoices.no_rel_pos_embs,
+    abs_pos_embs_mode=general_shared_constants.AbsPosEmbsModes.learned_pos_embs,
+    rel_pos_embs_mode=general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs,
     num_rel_pos_embs=64,
     max_epochs=100,
 
@@ -1073,7 +1077,7 @@ def main(
     ###########################################################################
     seed=453345,
     freeform_options=[True, False],
-    dataset_type=our_datasets.DatasetTypesChoices.oracle_basic_dataset,
+    dataset_type=general_shared_constants.DatasetTypesChoices.oracle_basic_dataset,
     max_level_training=6,
     do_log_results=True,
     path_log_results=DEFAULT_SAVE_DIR / "results.json",
@@ -1092,11 +1096,11 @@ def main(
     n_heads=4,
 ):
     all_arguments = locals().copy()
-    # Inspect is only used for a test
     assert all_arguments.keys() == inspect.signature(main).parameters.keys()
 
     extra_info_file: Final[Path] = Path(extra_info_file)
     checkpoints_folder: Final[Path] = Path(checkpoints_folder)
+    path_log_results: Final[Path] = Path(path_log_results)
 
     if extra_info_file.exists():
         with extra_info_file.open() as f:
@@ -1107,6 +1111,11 @@ def main(
             f"\n\t- {extra_info_file.exists()}: {extra_info_file}"
         )
     resuming = extra_info_file.exists()
+
+    # This is just to make the use without the launcher easier, we don't have to create
+    # The parent folder, which we assume would have to be created for this purpose
+    if not resuming and extra_info_file.parent == checkpoints_folder.parent == path_log_results.parent:
+        extra_info_file.parent.mkdir(parents=False, exist_ok=True)
 
 
     ###########################################################################
@@ -1120,9 +1129,9 @@ def main(
     ###############################################################
     # Handle resuming the Wandb run & setting the seeds
     ###############################################################
-    if dataset_type == our_datasets.DatasetTypesChoices.most_basic_dataset:
+    if dataset_type == general_shared_constants.DatasetTypesChoices.most_basic_dataset:
         ds_str = "most_basic"
-    elif dataset_type == our_datasets.DatasetTypesChoices.oracle_basic_dataset:
+    elif dataset_type == general_shared_constants.DatasetTypesChoices.oracle_basic_dataset:
         ds_str = "oracle"
     else:
         raise ValueError("Unknown dataset type")
@@ -1157,25 +1166,37 @@ def main(
 
 
     rich.print(f"Run name: [green]'{run_name}'\n")
-    utils.print_dict(all_arguments)
+    general_utils.print_dict(all_arguments)
 
     if do_log_results:
-        path_log_results = Path(path_log_results)
         if path_log_results.exists():
             assert resuming, f"The log file already exists, but we are not resuming: {path_log_results}"
-        
-    assert dataset_type in our_datasets.DATASET_TYPES, dataset_type
+
+    ###########################################################################
+    # Load the data    
+    # -------------------------------------------------------------------------
+    #  - Load the data & make some checks
+    #  - Possibly restrict trainnig to as subset of levels
+    #  - Handle the subsetting of the validation dataset
+    #  - Create the specialized dataset *objects* (eg. with or without scratchpad) 
+    ###########################################################################
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Load the data & make some checks
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    assert dataset_type in data_datasets.DATASET_TYPES, dataset_type
     assert freeform_options, freeform_options
     assert isinstance(freeform_options, (list, tuple, set)), freeform_options
     assert all(isinstance(x, bool) for x in freeform_options)
 
     dataset, dataset_config = data_generation_arithmetic.load_dataset(None, DATA_PATH / data_name)
     rich.print(vars(dataset_config))
-    
     train_ds : Dict[int, data_generation_arithmetic.Node] = dataset["train"]
     valid_ds : Dict[int, data_generation_arithmetic.Node] = dataset["eval"]
     assert len(train_ds) == inf_num, (len(train_ds), inf_num)
 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Restrict to the levels we want to train on
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     if max_level_training:
         assert max_level_training <= dataset_config.max_depth
         assert all(isinstance(node_name, int) for node_name in train_ds)
@@ -1184,9 +1205,29 @@ def main(
             in train_ds.items() if level_no <= max_level_training
         }
 
-    tokenizer = our_tokenizer.ArithmeticTokenizer()
-    train_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](train_ds, tokenizer)
-    valid_torch_dataset = our_datasets.DATASET_TYPES[dataset_type](valid_ds, tokenizer)
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Handle the subsetting of the validation dataset
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    subset_ids, subset_str = script_data_subset_selection.read_subset_file(DATA_PATH / data_name, subset_path)
+
+    for level, nodes in tqdm(valid_ds.items()):
+        assert isinstance(level, int)  
+        for node_id, node_str in more_itertools.zip_equal(tqdm(subset_ids[level]), subset_str[level]):
+            node: data_generation_arithmetic.Node = nodes[node_id]
+            assert node_str == node.get_input_str()
+
+    valid_ds_subset = {}
+    for level, nodes in valid_ds.items(): 
+        assert isinstance(level, int)
+        valid_ds_subset[level] = [nodes[idx] for idx in subset_ids[level]]
+    del valid_ds
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Create the dataset *objects* (eg. with or without scratchpad) 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    tokenizer = data_tokenizer.ArithmeticTokenizer()
+    train_torch_dataset = data_datasets.DATASET_TYPES[dataset_type](train_ds, tokenizer)
+    valid_torch_dataset = data_datasets.DATASET_TYPES[dataset_type](valid_ds_subset, tokenizer)
 
 
     ###############################################################
@@ -1240,8 +1281,8 @@ def main(
     assert CONC_MODE in ["yield", "top_sort"]
 
     if isinstance(
-        train_torch_dataset, our_datasets.SelfLearnedBasicDataset
-    ) and isinstance(valid_torch_dataset, our_datasets.SelfLearnedBasicDataset):
+        train_torch_dataset, data_datasets.SelfLearnedBasicDataset
+    ) and isinstance(valid_torch_dataset, data_datasets.SelfLearnedBasicDataset):
 
         train_torch_dataset.set_conc_mode(CONC_MODE)
         valid_torch_dataset.set_conc_mode(CONC_MODE)
@@ -1258,7 +1299,6 @@ def main(
         eval_ds=valid_torch_dataset,
         train_batch_size=batch_size,
         eval_batch_size=eval_batch_size,
-        num_workers_dl=0,
         generation_kwargs=GENERATION_KWARGS,
         learning_rate=LEARNING_RATE,
         is_adamw=True,
@@ -1309,7 +1349,6 @@ def main(
         max_epochs=max_epochs,
         gpus=NUM_GPUS,
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
-        limit_val_batches=NUM_SAMPLES_VALID // eval_batch_size,
     )
     
     if resuming:

@@ -6,12 +6,12 @@ import rich
 import torch
 import numpy as np
 
-import our_tokenizer
+import data_tokenizer
 
 
 class OurMetric(abc.ABC):
     @classmethod
-    def prepare(cls, tokenizer: our_tokenizer.Tokenizer, pred, label, do_print):
+    def prepare(cls, tokenizer: data_tokenizer.Tokenizer, pred, label, do_print):
         things_to_ignore = {
             -100,
         } | tokenizer.special_token_ids

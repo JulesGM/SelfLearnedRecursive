@@ -9,28 +9,26 @@ import collections
 import copy
 import concurrent.futures as futures
 import dataclasses
-import itertools
 import logging
 import math
 from pathlib import Path
 import pickle
 import time
 
-
 from beartype import beartype
 import pretty_traceback  # type: ignore
 
 pretty_traceback.install()
-import fire  # type: ignore
-import nltk  # type: ignore
-import numpy as np
+
 import random
 import rich
 from tqdm import tqdm  # type: ignore
 import orjson as json
 
-import utils
-import our_tokenizer
+import general_utils
+import data_tokenizer
+
+import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 DEBUG = True
@@ -52,8 +50,6 @@ def tree_depth_from_str(tree_string: str) -> int:
     assert cum_sum[-1] == 0
     val = np.max(cum_sum)
 
-    nltk_val = nltk.Tree.fromstring(tree_string).height() - 1
-    assert val == nltk_val, (val, nltk_val)
     return val
 
 
@@ -110,7 +106,7 @@ def all_nodes_have_root_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
 
 @beartype
 def prep_input_data(
-    tokenizer: our_tokenizer.Tokenizer,
+    tokenizer: data_tokenizer.Tokenizer,
     input_str: str,
     pseudo_without_head: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -129,6 +125,13 @@ def load_dataset(
 ) -> Tuple[DefaultDict[str, DefaultDict[int, list["Node"]]], "EquationConfig"]:
     LOGGER.debug(f"Reading and parsing dataset from {json_path} or from {pkl_path}")
 
+    ###########################################################################
+    # Either load the dataset from a json file or from a pickle file.
+    # -------------------------------------------------------------------------
+    # The data should be identical, the data in the pickle file is a dict of
+    # basic types (the same as in the json file). We use pickle because
+    # it was faster in practice.
+    ###########################################################################
     dicts: dict[str, Any]
     if pkl_path:
         rich.print(f'Loading PKL data file "{pkl_path}"')
@@ -139,23 +142,39 @@ def load_dataset(
         assert json_path
         with open(json_path, "r") as f:
             dicts = json.loads(f.read())
+        
+        # Convert the keys to ints
+        for split in dicts:
+            for level in dicts[split]:
+                dicts[split][int(level)] = dicts[split][level]
+                del dicts[split][level]
+
     rich.print("Done loading file.")
 
+    ###########################################################################
+    # Parse the dataset.
+    ###########################################################################
     LOGGER.debug(f"Parsing structures from the dicts.")
+    
+    # Build the config object.
     config = dicts["config"]
     config_obj = EquationConfig.from_json_dict(config)
 
-    data = dicts["data"]
-
+    # Do some checks on the data and its structure.
+    data : dict[str, dict[int, list[dict[str, Any]]]]= dicts["data"]
     assert isinstance(data, dict)
     assert set(data.keys()) == {"train", "eval"}, data.keys()
-    for split in data.values():
-        print(split.keys())
+    for split in data.values():  # type: ignore[assignment]
+        print(split.keys())  # type: ignore[attr-defined]  # The levels.
+        # spit is a dict of levels to list of nodes.
         assert isinstance(split, dict)
+        # split[1] is a list of nodes
         assert isinstance(split[1], list)
+        # split[1][0] is a Node
         assert isinstance(split[1][0], dict)
         assert "op" in split[1][0]
 
+    # Build the nodes of the dataset.
     print("Building nodes")
     output: DefaultDict[str, DefaultDict[int, list[Node]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
@@ -385,7 +404,7 @@ class Node:
         head_type: str,
         conc_mode: str,
         logging_info: "PredLogger",
-        tokenizer: our_tokenizer.Tokenizer,
+        tokenizer: data_tokenizer.Tokenizer,
     ):
         """
 
@@ -624,7 +643,7 @@ def filter_length(
     root: Node,
     max_len_answer: Optional[int],
     max_len_total: Optional[int],
-    tokenizer: our_tokenizer.Tokenizer,
+    tokenizer: data_tokenizer.Tokenizer,
 ) -> bool:
 
     complete_str = root.get_oracle_str()[0]
@@ -722,7 +741,7 @@ def first_level_and_more(
 def generate_data(
     config: "EquationConfig",
 ) -> dict[str, dict[int, Any]]:
-    tokenizer = our_tokenizer.ArithmeticTokenizer()
+    tokenizer = data_tokenizer.ArithmeticTokenizer()
     filter_length_lambda = FilterLengthFunctor(
         config.max_answer_length, config.max_total_length, tokenizer
     )
@@ -739,7 +758,7 @@ def generate_data(
                 split: per_set[split][level - 1] for split in ["train", "eval"]
             },
             all_split_previous={
-                split: utils.concat_lists(per_set[split].values())
+                split: general_utils.concat_lists(per_set[split].values())
                 for split in ["train", "eval"]
             },
             filter_length_lambda=filter_length_lambda,
@@ -764,8 +783,8 @@ def generate_data(
     # Make some checks on all root nodes, fix root_level_complexity
     ################################################################################
     print("Building a list of all nodes.")
-    all_root_nodes = utils.concat_lists(
-        utils.concat_lists(
+    all_root_nodes = general_utils.concat_lists(
+        general_utils.concat_lists(
             [[v for v in tqdm(x.values())] for x in tqdm(per_set.values())]
         )
     )

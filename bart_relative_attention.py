@@ -12,6 +12,8 @@ import numpy as np
 
 import transformers.models.bart.modeling_bart as original
 
+import general_shared_constants
+
 
 class RelAttBartAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -319,30 +321,27 @@ class RelAttBartEncoderLayer(nn.Module):
         return outputs
 
 
-class RelPosEmbsChoices:
-    no_rel_pos_embs = "no_rel_pos_embs"
-    one_embedder = "one_embedder"
-    two_embedders = "two_embedders"
-    __choices__ = {one_embedder, two_embedders, no_rel_pos_embs}
-
-
 class RelPosEmbs(nn.Module):
     def __init__(self, model_d: int, num_embeddings: int, mode: str):
         super().__init__()
-        assert mode != RelPosEmbsChoices.no_rel_pos_embs, "RelPosEmbs Should not be initialized in this case"    
-        assert mode in RelPosEmbsChoices.__choices__, f"mode {mode} not in {RelPosEmbsChoices.__choices__}"
+        assert mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs, (
+            "RelPosEmbs Should not be initialized in this case"
+        )
+        assert mode in general_shared_constants.RelPosEmbsChoices.__choices__, (
+            f"mode {mode} not in {general_shared_constants.RelPosEmbsChoices.__choices__}"
+        )
 
         self.mode = mode
         self.num_embeddings = num_embeddings
 
-        if mode == RelPosEmbsChoices.two_embedders:
+        if mode == general_shared_constants.RelPosEmbsChoices.two_embedders:
             self.positional_embeddings_k = nn.Embedding(
                 num_embeddings=num_embeddings, embedding_dim=model_d
             )
             self.positional_embeddings_v = nn.Embedding(
                 num_embeddings=num_embeddings, embedding_dim=model_d, 
             )
-        elif mode == RelPosEmbsChoices.two_embedders:
+        elif mode == general_shared_constants.RelPosEmbsChoices.two_embedders:
             self.positional_embeddings = nn.Embedding(
                 num_embeddings=num_embeddings, embedding_dim=model_d
             )
@@ -359,14 +358,14 @@ class RelPosEmbs(nn.Module):
             num_embeddings=self.num_embeddings, 
         )
         
-        if self.mode == RelPosEmbsChoices.two_embedders:
+        if self.mode == general_shared_constants.RelPosEmbsChoices.two_embedders:
             assert self.positional_embeddings_k.weight.device == self.positional_embeddings_v.weight.device
 
             positions = positions.to(self.positional_embeddings_k.weight.device)
             k = self.positional_embeddings_k(positions)
             v = self.positional_embeddings_v(positions)
             return k, v
-        if self.mode == RelPosEmbsChoices.one_embedder:
+        if self.mode == general_shared_constants.RelPosEmbsChoices.one_embedder:
             positions = positions.to(self.positional_embeddings.weight.device)
             shared = self.positional_embeddings(positions)
             k = self.positional_embeddings_linear_k(shared)
