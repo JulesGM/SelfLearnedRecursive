@@ -31,7 +31,7 @@ print("Done with imports")
 
 SCRIPT_DIR = Path(__file__).absolute().parent
 PROJECT_ROOT : Final[Path] = SCRIPT_DIR
-PYTHON_START: Final[list[str]] = [str(PROJECT_ROOT / "main.py")]
+PYTHON_START: Final[list[str]] = [str(PROJECT_ROOT / "bin_main.py")]
 
 CONFIG = dict(
     data_name="349_6_6_200000.json.pkl",    

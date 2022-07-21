@@ -17,7 +17,10 @@ from tqdm import tqdm  # type: ignore[import]
 
 from beartype import beartype
 from beartype.typing import *
+import pretty_traceback  # type: ignore
+pretty_traceback.install()
 
+import data_tokenizer
 import general_utils
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -31,20 +34,22 @@ def convert(input_path):
 
     for i in range(len(content)):
         for k, v in content[i]["results"].items():
-            content[i]["results"][k] = np.asarray(v["True"]["per_batch"], dtype=np.int64)
+            content[i]["results"][k] = np.asarray(content[i]["results"][k]["True"]["per_batch"], dtype=np.int64)
 
     with open(input_path.parent / "numpy_predictions.msgpack", "wb") as f:
         msgpack.pack(content, f)
 
 @beartype
 def main(
-    path: Union[str, Path] = SCRIPT_DIR / "log_results/oracle/"
+    path: Union[str, Path] = SCRIPT_DIR / "log_results/oracle/",
+    n_cpus: int = int(os.getenv("SLURM_CPUS_ON_NODE", os.cpu_count())),
 ):
 
     all_arguments = locals().copy()
     assert all_arguments.keys() == inspect.signature(main).parameters.keys()
     rich.print("[bold]Arguments:")
     general_utils.print_dict(all_arguments)
+    print()
 
     path = Path(path)
     directories = list(path.iterdir())
@@ -59,9 +64,9 @@ def main(
     rich.print(active)
 
     rich.print("[bold]Converting.")
-    rich.print(f"{os.cpu_count() = }")
+    rich.print(f"{n_cpus = }")
     start = time.perf_counter()
-    with multiprocessing.Pool() as pool:
+    with multiprocessing.Pool(n_cpus) as pool:
         list(pool.map(convert, active))
         pool.close()
         pool.join()
