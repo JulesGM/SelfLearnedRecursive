@@ -44,12 +44,7 @@ def main(
     path: Union[str, Path] = SCRIPT_DIR / "log_results/oracle/",
     n_cpus: int = int(os.getenv("SLURM_CPUS_ON_NODE", os.cpu_count())),
 ):
-
-    all_arguments = locals().copy()
-    assert all_arguments.keys() == inspect.signature(main).parameters.keys()
-    rich.print("[bold]Arguments:")
-    general_utils.print_dict(all_arguments)
-    print()
+    general_utils.check_and_print_args(locals().copy(), main)
 
     path = Path(path)
     directories = list(path.iterdir())

@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import argparse
 from pathlib import Path
 import pickle
@@ -14,7 +17,7 @@ def main():
 
     for file in tqdm(files):
         with open(file, "rb") as f:
-            obj = pickle.load(f)
+            obj = pickle.load(f)a
         print("Loaded data")
         print(obj["config"])
         config = argparse.Namespace(**obj["config"])

@@ -121,9 +121,13 @@ def prep_input_data(
 
 
 def load_dataset(
-    json_path: str, pkl_path: str
+    json_path: Union[str, Path], pkl_path: Union[str, Path], splits=None,
 ) -> Tuple[DefaultDict[str, DefaultDict[int, list["Node"]]], "EquationConfig"]:
     LOGGER.debug(f"Reading and parsing dataset from {json_path} or from {pkl_path}")
+
+    ACCEPTABLE_SPLITS = {"train", "eval"}
+    if splits is None:
+        splits = ACCEPTABLE_SPLITS
 
     ###########################################################################
     # Either load the dataset from a json file or from a pickle file.
@@ -155,15 +159,14 @@ def load_dataset(
     # Parse the dataset.
     ###########################################################################
     LOGGER.debug(f"Parsing structures from the dicts.")
-    
-    # Build the config object.
-    config = dicts["config"]
-    config_obj = EquationConfig.from_json_dict(config)
 
-    # Do some checks on the data and its structure.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Do a sanity check about the structure of the data
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     data : dict[str, dict[int, list[dict[str, Any]]]]= dicts["data"]
     assert isinstance(data, dict)
-    assert set(data.keys()) == {"train", "eval"}, data.keys()
+    assert set(data.keys()) == ACCEPTABLE_SPLITS, (data.keys(), ACCEPTABLE_SPLITS)
+
     for split in data.values():  # type: ignore[assignment]
         print(split.keys())  # type: ignore[attr-defined]  # The levels.
         # spit is a dict of levels to list of nodes.
@@ -174,17 +177,27 @@ def load_dataset(
         assert isinstance(split[1][0], dict)
         assert "op" in split[1][0]
 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Build the nodes of the dataset.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     print("Building nodes")
     output: DefaultDict[str, DefaultDict[int, list[Node]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
     )
-    for split, split_data in data.items():
+    for split in splits:
+        split_data = data[split]
         for level_idx, level_list in tqdm(
             split_data.items(), desc=f"Building nodes for {split}"
         ):
             for node_dict in tqdm(level_list, desc=f"building level {level_idx} nodes"):
                 output[split][level_idx].append(Node.from_json_dict(node_dict))
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Build the config object.
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    config = dicts["config"]
+    config_obj = EquationConfig.from_json_dict(config)
+
 
     LOGGER.debug(f"Done loading dataset.")
     return output, config_obj

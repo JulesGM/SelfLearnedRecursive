@@ -1,49 +1,14 @@
 # Self Learned Explanations for Transformer Language Models
-Things to do:
-x  - Fix generation batching
-   x ---> modify the bart class to correct the decoder embeddings
-   x ---> corrected decoder padding
-   x ---> fixed caching
-   x --- ---> Check that the outputs are identical with and without caching
-
-x - Fix the length of the generations for the fake labels
-x ---> max_gen = len(decoder_input_ids) + 
-x - Debug length thing
-
-x - Mask the self generated output at training time
-   x - Make sure nothing uses the labels internally to generate decoder input ids.
-      x - Look inside of the sample collator
-   x  - The thing that returns the labels in datasets now should return both the masked labels and the decoder input ids
-   x  - In self-learned dataset, return both decoder_input_ids and labels.
-x - EM just for the end? 
-
-
-- Repair most basic. Seems fucked. Still seems fucked? Why are we generating two bos EVERY TIME?? Why aren't we learning the regular shit.
----> I should try to use GPT2
-
-- There is some weird shit in the evaluation. 
----> I should know the perf of freeform oracle but just after the equal. That's the important thing.
-
-- Train / Eval overlap.
-- Understand why the model doesn't learn the most basic dataset... this is suspect.
-
-- Generate new dataset that respects the length constraints 
-   - Go to datagen
-   - Don't stop generating until the constraints are respected
-
-- Add separate dataset ?
-
+- 
 
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 How to make it faster:
- - Only use parens. Would reduce generation length by a lot, & training speed as well even for oracle mode.
  - No beam search
  - Better work stack building
  - Modify generation lengths
  - We tok encode and decode for kind of no reason
- - Use curriculum learning, For a certain node, do both children at once?
  - Multiple levels at once
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # coding: utf-8
 
 from beartype import beartype
@@ -12,6 +12,8 @@ from typing import *
 import fire  # type: ignore[import]
 import numpy as np
 import rich
+
+import general_utils
 
 try:
     import ujson as json
@@ -28,7 +30,9 @@ def md5sum(filename: Union[str, Path]):
         return hashlib.md5(f.read()).hexdigest()
 
 @beartype
-def read_subset_file(target_dataset: Union[str, Path], filepath: Union[str, Path]):
+def read_subset_file(
+    target_dataset: Union[str, Path], filepath: Union[str, Path]
+):
 
     with open(filepath, "r") as fin:
         subset_conf = json.load(fin)
@@ -63,6 +67,7 @@ def main(
 
     seed: int = 453345,
 ):
+    general_utils.check_and_print_args(locals().copy(), main)
 
     random.seed(seed)
     np.random.seed(seed)

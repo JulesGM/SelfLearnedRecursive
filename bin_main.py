@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # coding: utf-8
 
 print("Importing modules.")
@@ -1095,8 +1095,7 @@ def main(
     n_layers=2,
     n_heads=4,
 ):
-    all_arguments = locals().copy()
-    assert all_arguments.keys() == inspect.signature(main).parameters.keys()
+    general_utils.check_and_print_args(locals().copy(), main)
 
     extra_info_file: Final[Path] = Path(extra_info_file)
     checkpoints_folder: Final[Path] = Path(checkpoints_folder)
@@ -1116,7 +1115,6 @@ def main(
     # The parent folder, which we assume would have to be created for this purpose
     if not resuming and extra_info_file.parent == checkpoints_folder.parent == path_log_results.parent:
         extra_info_file.parent.mkdir(parents=False, exist_ok=True)
-
 
     ###########################################################################
     # Set the seeds
