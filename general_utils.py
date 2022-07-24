@@ -1,7 +1,9 @@
 import collections
+import functools
 import inspect
 import itertools
 from pathlib import Path
+import subprocess
 
 from beartype.typing import *
 import rich
@@ -24,16 +26,26 @@ def check_args(all_arguments, function):
         f"{sorted(inspect.signature(function).parameters.keys())}"
     )
 
+def shorten_path(path):
+    path = Path(path)
+    if path.is_relative_to(SCRIPT_DIR):
+        path = "<pwd> /" + str(path.relative_to(SCRIPT_DIR))
+    else:
+        path = str(path)
+    return path
+
+def print_list(_list):
+    for line in _list:
+        if isinstance(line, Path):
+            line = shorten_path(line)
+        rich.print(f"\t- {line}")
 
 def print_dict(_dict: dict[str, Any]) -> None:
     # Pad by key length
     max_len = len(max(_dict, key=lambda key: len(str(key)))) + 1
     for k, value in _dict.items():
         if isinstance(value, Path):
-            if value.is_relative_to(SCRIPT_DIR):
-                value = "<pwd> /" + str(value.relative_to(SCRIPT_DIR))
-            else:
-                value = str(value)
+            value = shorten_path(value)
 
         rich.print(f"\t- {k} =" + (max_len - len(k)) * " " + f" {value}")
 
@@ -93,3 +105,149 @@ def concat_tuples(tuples):
 
 def concat_iters(iters):
     return list(itertools.chain.from_iterable(iters))
+
+
+def str_gt(a: str, b: str, verbose=False):
+    """
+    Function to compare strings that have numbers in them, to 
+    get a natural sorting order. Useful for paths. 
+    """
+    number_chars_a = ""
+    number_chars_b = ""
+    
+    if a == b:
+        return False
+    
+    for aa, bb in itertools.zip_longest(a, b, fillvalue=None):
+        # Break both streaks or just one of them
+        if aa is None or bb is None:
+            if aa is not None:
+                if aa.isnumeric():
+                    number_chars_a += aa
+                if verbose:
+                    print("Break. bb is None, aa is not None", (aa, bb), (number_chars_a, number_chars_b))
+                break
+
+            if bb is not None:
+                if bb.isnumeric():
+                    number_chars_b += bb
+                if verbose:
+                    print("Break. aa is None, bb is not None", (aa, bb), (number_chars_a, number_chars_b))
+                break
+
+        both_not_numeric_not_equal = not aa.isnumeric() and not bb.isnumeric() and aa != bb
+        one_numeric_one_not = not aa.isnumeric() and bb.isnumeric() or aa.isnumeric() and not bb.isnumeric()
+        
+        if one_numeric_one_not:
+            if aa.isnumeric():
+                number_chars_a += aa
+                if verbose:
+                    print("Break. aa is numeric, not bb", (aa, bb), (number_chars_a, number_chars_b))
+                break
+
+            if bb.isnumeric():
+                number_chars_b += bb
+                if verbose:
+                    print("Break. bb is numeric, not aa", (aa, bb), (number_chars_a, number_chars_b))
+                break
+            if verbose:
+                print("End. One numeric one not.", (aa, bb), (number_chars_a, number_chars_b))            
+            return aa > bb
+
+        if both_not_numeric_not_equal:
+            if number_chars_a or number_chars_b:
+                if verbose:    
+                    print("Streak Break. Both not numeric not equal.", (aa, bb), (number_chars_a, number_chars_b))
+                break
+            if verbose:
+                print("End. No streak, both not numeric not equal.", (aa, bb), (number_chars_a, number_chars_b))
+            return aa > bb
+
+        # Streak continues
+        if aa.isnumeric() and bb.isnumeric():
+            number_chars_a += aa
+            number_chars_b += bb
+            if verbose:
+                print("Numeric streak", (aa, bb), (number_chars_a, number_chars_b))
+            continue
+
+        if aa == bb and not aa.isnumeric() and not bb.isnumeric():
+            if number_chars_a != number_chars_b:
+                if verbose:
+                    print("Streak Break. Both not numeric.", (aa, bb), (number_chars_a, number_chars_b))
+                break
+            else:
+                number_chars_a = ""
+                number_chars_b = ""
+
+            if verbose:
+                print("Continuing. Both not numeric, no numbers thus far.", (aa, bb), (number_chars_a, number_chars_b))
+            continue
+    
+    if number_chars_a != number_chars_b:
+        if number_chars_a and not number_chars_b:
+            return True
+        if not number_chars_a and number_chars_b:
+            return False
+
+        if verbose:
+            print("End of loop break, Numbers are compared", (a, b), (number_chars_a, number_chars_b))
+            
+        return int(number_chars_a) > int(number_chars_b)
+
+    assert False
+
+
+def cmp_str(a, b):
+    assert isinstance(a, (str, Path))
+    assert isinstance(b, (str, Path))
+
+    a = str(a)
+    b = str(b)
+
+    if a == b:
+        return 0
+    if str_gt(a, b):
+        return 1
+    else:
+        return -1
+
+def sort_iterable_text(list_text):
+    return sorted(list_text, key=functools.cmp_to_key(cmp_str))
+
+def find_last(seq: Sequence[Any], item: Any) -> int:
+    return len(seq) - seq[::-1].index(item) - 1
+
+def cmd(command: list[str]) -> list[str]:
+    return subprocess.check_output(command).decode("utf-8").strip().split("\n")
+
+def only_one(it: Iterable):
+    iterated = iter(it)
+    good = next(iterated)
+    for bad in iterated:
+        raise ValueError("Expected only one item, got more than one.")
+    return good
+
+
+def count_lines(path: Path) -> int:
+    return int(check_len(only_one(cmd(["wc", "-l", str(path)])).split(), 2)[0])
+
+def check_len(seq: Sequence, expected_len: int) -> Sequence:
+    if not len(seq) == expected_len:
+        raise ValueError(f"Expected {expected_len} items, got {len(seq)}.")
+    return seq
+
+SIZE_HUMAN_NAMES = {
+        0: "B",
+        1: "KB",
+        2: "MB",
+        3: "GB",
+    }
+
+def to_human_size(size: int) -> str:
+    if size == 0:
+        return "0 B"
+
+    exponent = int(math.log(size, 1000))
+    mantissa = size / 1000 ** exponent
+    return f"{mantissa:.2f} {SIZE_HUMAN_NAMES[exponent]}"
