@@ -52,11 +52,11 @@ def _convert(
     input_path: Union[str, Path],
     tokenizer: data_tokenizer.ArithmeticTokenizer,
     input_ids: np.ndarray,
-    label_ids: np.ndarray,
     max_epochs: int = None,
     verbose: bool = False,
     queue = None,
 ):
+    start_time = time.process_time()
     if verbose:
         print("Working.")
     
@@ -169,10 +169,6 @@ def _convert(
             "input_samples", 
             data=input_ids,
         )
-        output_file.create_dataset(
-            script_add_label_info_to_subset_h5.H5_LABEL_IDS_KEY,
-            data=label_ids,
-        )
 
         output_file.create_dataset(
             "predictions",
@@ -226,16 +222,17 @@ def _convert(
     if verbose:
         rich.print("[bold]Done h5py.")
 
+    
     if queue:
         queue.put(None)
-
+    
+    return time.process_time() - start_time
 
 class _ConvertFunctor:
     def __init__(self, tokenizer, max_epochs, input_ids, label_ids):
         self._tokenizer = tokenizer
         self._max_epochs: Optional[int] = max_epochs
         self._input_ids = input_ids
-        self._label_ids = label_ids
         if max_epochs:
             rich.print(f"[red]{max_epochs = }")
 
@@ -245,7 +242,6 @@ class _ConvertFunctor:
             tokenizer=self._tokenizer, 
             max_epochs=self._max_epochs, 
             input_ids=self._input_ids,
-            label_ids=self._label_ids,
             verbose=verbose, 
             queue=queue,
         )
@@ -324,7 +320,7 @@ def main(
     ###########################################################################
     print()
     rich.print("[bold]Starting multiprocessing.")
-    functor = _ConvertFunctor(tokenizer, max_epochs=max_epochs, input_ids=input_ids, label_ids=label_ids)
+    convert_functor = _ConvertFunctor(tokenizer, max_epochs=max_epochs, input_ids=input_ids, label_ids=label_ids)
     start = time.perf_counter()
     if not test_run:
         if method == LaunchMethods.launch_few:
@@ -344,7 +340,7 @@ def main(
             for i, path in enumerate(tqdm(active, desc="Running jobs")):
                 queue.get()
                 print(f"Started {i}")
-                process = thread_or_process_type(target=functor, args=(path, queue))
+                process = thread_or_process_type(target=convert_functor, args=(path, queue))
                 processes.append(process)
                 process.start()
 
@@ -360,28 +356,48 @@ def main(
             elif thread_or_process_type == multiprocessing.Process:
                 PoolType = multiprocessing.Pool
             
+            promises = []
+            times = []
             with PoolType(n_cpus) as pool:
-                pool.map(functor, active)
+                for path in active:
+                    promises.append(pool.apply_async(convert_functor, (path,)))
+                
+                for promise in tqdm(promises, desc="Running conversion jobs."):
+                    times.append(promise.get())
 
         elif method == LaunchMethods.launch_one:
             for path in tqdm(active):
-                functor(path, queue=None, verbose=True)
+                convert_functor(path, queue=None, verbose=True)
 
         else:
             raise ValueError(f"Unknown method: {method}")
+    duration = time.perf_counter() - start
+    print()
+    rich.print("[bold]Done running jobs. Writing label_ids and input_ids.")
 
-    print("Done running jobs.")
+    def write_label_ids(input_path: Path):
+        output_path = input_path.parent / f"{input_path.stem}.h5"
+
+        with h5py.File(output_path, "r+") as f:
+            f.create_dataset("label_ids", data=label_ids)
+
+    with mp_pool.ThreadPool(n_cpus) as pool:
+        promises = [pool.apply_async(write_label_ids, (path,)) for path in active]
+        for promise in tqdm(promises, desc="Writing `label_ids`."):
+            promise.get()
 
     #######################################################################
     # Print some stats
     #######################################################################
-    duration = time.perf_counter() - start
+    duration_w_more_stuff = time.perf_counter() - start
     print("Done with multiprocessing.")
     rich.print(f"[bold]Done in {duration:.2f} seconds.")
-    rich.print(f" - This is {duration / os.cpu_count()} s/cpu.")
+    rich.print(f" - This is {duration / n_cpus} s/cpu.")
     rich.print(f" - This is {duration / len(active)} s/file")
-    rich.print(f" - This is {duration / (os.cpu_count() * len(active))} s/(cpu * file)")
-
+    rich.print(f" - Average time of one file was {np.mean(times):.1f} seconds.")
+    rich.print(f" - The linear time would have been {np.sum(times):.1f} seconds.")
+    rich.print(f" - This is an improvement of {np.mean(times) / duration:0.1f} times.")
+    print(f"{duration_w_more_stuff:.2f} seconds with more stuff.")
 
 if __name__ == "__main__":
     fire.Fire(main)

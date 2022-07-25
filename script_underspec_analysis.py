@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+"""
+
+"""
 
 print("Doing imports")
 import collections
@@ -8,6 +11,7 @@ import concurrent.futures
 import enum
 import math
 import multiprocessing
+import multiprocessing.pool as mp_pool
 from pathlib import Path
 import itertools
 import json
@@ -53,6 +57,20 @@ def extract_pred_oracle(string: str) -> Optional[int]:
 
 extract_pred_basic = extract_pred_oracle
 
+def compute_accuracy(path, min_no, tokenizer, labels, extract_pred_fn) -> np.ndarray:
+    start = time.process_time()
+    accuracies = np.zeros(min_no, dtype=np.float64)
+    with h5py.File(path, "r") as file:
+        for epoch_idx in range(min_no):
+            values = []
+            for label, pred in more_itertools.zip_equal(labels, file[H5_PREDICTIONS_KEY][epoch_idx]):
+                pred_str = tokenizer.decode(pred, ignore_special_symbols=True)
+                maybe_pred_num = extract_pred_fn(pred_str)
+                values.append(maybe_pred_num == label)
+            accuracies[epoch_idx] = np.mean(values)
+
+    return accuracies, time.process_time() - start
+
 class Modes(str, enum.Enum):
     oracle = "oracle"
     basic = "basic"
@@ -61,10 +79,11 @@ class Modes(str, enum.Enum):
 # List the output files of an experiment
 ########################################################################################
 def main(
-    name=Modes.oracle.value,
+    name=Modes.basic.value,
     ignore_bads=True,
     max_length=60,
     test_run=False,
+    n_cpus=10,
 ):
     general_utils.check_and_print_args(locals().copy(), main)
     
@@ -152,9 +171,13 @@ def main(
     assert all([
         np.all(files[1][H5_INPUT_IDS_KEY][:min_no] == 
         files[i][H5_INPUT_IDS_KEY][:min_no]) for i in range(len(files))
-    ]), "Failed still somehow"
-    assert all([H5_LABEL_IDS_KEY in file for file in files]), [file.keys() for file in files]
-    
+    ]), "Some different input ids"
+
+    assert all([
+        np.all(files[1][H5_LABEL_IDS_KEY][:min_no] == 
+        files[i][H5_LABEL_IDS_KEY][:min_no]) for i in range(len(files))
+    ]), "Some different label ids"
+
     print()
     rich.print("[bold]Passed the checks.")
     print()
@@ -166,21 +189,46 @@ def main(
     tokenizer = data_tokenizer.ArithmeticTokenizer()
 
     labels = []
-    for file in tqdm(files, desc="Decoding labels"):
-        for sample in file[H5_LABEL_IDS_KEY]:
-            label = tokenizer.decode(sample, ignore_special_symbols=True).replace(" ", "")
-            int(label)  # Labels should be valid integers. This "useless" conversion checks this.
-            labels.append(label)
-
     accuracies = np.zeros((len(active), min_no), dtype=np.float64)
+
+    for sample in files[0][H5_LABEL_IDS_KEY]:
+        label = tokenizer.decode(sample, ignore_special_symbols=True).replace(" ", "")
+        int(label)  # Labels should be valid integers. This "useless" conversion checks this.
+        labels.append(label)
+
+    
+    promises = []
+    accuracies_list = []
+    times = []
+
+    cpus_to_use = min(n_cpus, len(active))
+    start = time.perf_counter()
+    with multiprocessing.Pool(cpus_to_use) as pool:
+        for i, path in enumerate(active):
+            promises.append(
+                pool.apply_async(
+                    compute_accuracy, (path, min_no, tokenizer, labels, extract_pred_fn)
+                )
+            )
+        
+        for promise in tqdm(promises):
+            acc, time_ = promise.get()
+            accuracies_list.append(acc)
+            times.append(time_)
+    
+    computation_time = time.perf_counter() - start
+
+    rich.print(f"[bold]Perf analysis")
+    rich.print(f"\t- Computation time: {computation_time}s")
+    rich.print(f"\t- Linear time: {np.sum(times)}s")
+    rich.print(f"\t- [bold]Improvement of {np.sum(times) / computation_time}x")
+    print("{cpus_to_use} cpus used")
+    print()
+
+    accuracies = np.array(accuracies_list)
+    assert accuracies.shape == (len(active), min_no), f"{accuracies.shape = }, {(len(active), min_no) = }"
+
     for epoch_idx in range(min_no):
-        for file_idx, file in enumerate(files):
-            values = []
-            for label, pred in zip(labels, file[H5_PREDICTIONS_KEY][epoch_idx]):
-                pred_str = tokenizer.decode(pred, ignore_special_symbols=True)
-                maybe_pred_num = extract_pred_fn(pred_str)
-                values.append(maybe_pred_num == label)
-            accuracies[file_idx, epoch_idx] = np.mean(values)
         rich.print(f"{epoch_idx = }: {np.mean(accuracies[:, epoch_idx]):0.1%}")
     
     per_epoch_acc = np.mean(accuracies, axis=0)
@@ -189,39 +237,64 @@ def main(
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Compute agreement
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    agreement_per_epoch = []
+    print()
+    rich.print("[bold]Computing agreement.")
+    top_1_agreement_per_epoch = []
+    pairwise_agreement_per_epoch = []
     for epoch_idx in tqdm(range(min_no), desc="Computing agreement scores per epoch"):
-        agreement_per_sample = []
+        top_1_agreement_per_sample = []
+        pairwise_agreement_per_sample = []
         arrays = [file["predictions"][epoch_idx] for file in files]
         for samples in zip(*arrays):
             text_samples = [extract_pred_fn(tokenizer.decode(sample, ignore_special_symbols=True)) for sample in samples]
             top = collections.Counter(text_samples).most_common(1)
-            agreement = top[0][1] / len(text_samples)
-            agreement_per_sample.append(agreement)
+            top_1_agreement = top[0][1] / len(text_samples)
+            top_1_agreement_per_sample.append(top_1_agreement)
+            
+            pairwise_good = 0
+            pairwise_total = 0
+            for i in range(len(text_samples)):
+                for j in range(i + 1, len(text_samples)):
+                    pairwise_good += text_samples[i] == text_samples[j]
+                    pairwise_total += 1
+            
+            pairwise_agreement_per_sample.append(pairwise_good / pairwise_total)
     
-        print(f"Epoch {epoch_idx} Agreement: {np.mean(agreement_per_sample):0.1%}, Accuracy: {per_epoch_acc[epoch_idx]:0.1%}")
-        agreement_per_epoch.append(np.mean(agreement_per_sample))
-    print(f"Averaged agreement: {np.mean(agreement_per_epoch):0.1%}")
+        print(f"Epoch {epoch_idx}:")
+        print(f"\t- Accuracy:            {per_epoch_acc[epoch_idx]:0.1%}")
+        print(f"\t- Pairwise Agreement:  {np.mean(pairwise_agreement_per_sample):0.1%}")
+        print(f"\t- Top-1 Agreement:     {np.mean(top_1_agreement_per_sample):0.1%}")
+        print()
+        top_1_agreement_per_epoch.append(np.mean(top_1_agreement_per_sample))
+        pairwise_agreement_per_epoch.append(np.mean(pairwise_agreement_per_sample))
+
+    print()
+    print(f"[bold]Averaged Top-1 Agreement: {np.mean(top_1_agreement_per_epoch):0.1%}")
+    print(f"[bold]Averaged Pairwise Agreement: {np.mean(pairwise_agreement_per_epoch):0.1%}")
+    print()
 
     if not test_run:
-        validation_accuracy_per_epoch = []
-        with h5py.File("agreement.h5", "w") as f:
+        with h5py.File(f"agreement_{name}.h5", "w") as f:
             f.attrs.update(dict(
-                average_agreement_per_epoch=agreement_per_epoch,
-                average_validation_accuracy_per_epoch=np.mean(validation_accuracy_per_epoch),
-                files_used=active,
-                file_md5s=[md5sum(file) for file in active],
-            ), f)
+                files_used=[str(path) for path in active],
+                file_md5s=[md5sum(path) for path in active],
+            ))
 
             f.create_dataset(
-                "validation_accuracy_per_epoch", 
-                data=validation_accuracy_per_epoch,
+                "top-1_agreement_per_sample", 
+                data=np.array(top_1_agreement_per_epoch, dtype=np.float64),
             )
 
             f.create_dataset(
-                "accuracies",
-                data=accuracies
+                "pairwise_agreement_per_sample", 
+                data=np.array(pairwise_agreement_per_epoch, dtype=np.float64),
             )
+
+            f.create_dataset(
+                "accuracy_per_epoch", 
+                data=np.array(accuracies, dtype=np.float64),
+            )
+
 
 
 if __name__ == "__main__":
