@@ -39,23 +39,27 @@ from tqdm import tqdm  # type: ignore[import]
 
 import data_tokenizer
 import general_utils
-
+import script_add_label_info_to_subset_h5
 pretty_traceback.install()
 
 
 SCRIPT_DIR = Path(__file__).absolute().parent
+DATA_DIR = SCRIPT_DIR / "data"
+
+PathType = Union[Path, str]
 
 def _convert(
     input_path: Union[str, Path],
     tokenizer: data_tokenizer.ArithmeticTokenizer,
+    input_ids: np.ndarray,
+    label_ids: np.ndarray,
     max_epochs: int = None,
     verbose: bool = False,
     queue = None,
 ):
     if verbose:
         print("Working.")
-
-
+    
     ###########################################################################
     # Read the data
     ###########################################################################
@@ -100,7 +104,6 @@ def _convert(
 
     if verbose:
         rich.print("[bold]Done reading jsonl.")
-
 
     ###########################################################################
     # Prep the data
@@ -161,18 +164,21 @@ def _convert(
             rich.print("Creating datasets.")
 
         assert tokenizer.pad_token_id == 0, tokenizer.pad_token_id
+        
         output_file.create_dataset(
             "input_samples", 
-            shape=(num_samples, 0), 
-            maxshape=(num_samples, None),
-            dtype=np.int64,
+            data=input_ids,
         )
+        output_file.create_dataset(
+            script_add_label_info_to_subset_h5.H5_LABEL_IDS_KEY,
+            data=label_ids,
+        )
+
         output_file.create_dataset(
             "predictions",
             shape=(num_epochs, num_samples, len_seqs_output),
             dtype=np.int64,
         )
-        input_samples = output_file["input_samples"]
         predictions = output_file["predictions"]
         
         if verbose:
@@ -194,12 +200,11 @@ def _convert(
                 # Make sure that we're only adding keys if we're in the zeroth epoch
                 if real_epoch == 0:
                     tokenized = tokenizer.encode(k, return_tensors=None)
-                    if input_samples.shape[1] < len(tokenized):
-                        input_samples.resize(len(tokenized), axis=1)
-                    
-                    input_samples[input_idx] = tokenized + [
+                    input_ids_gen = tokenized + [
                         tokenizer.pad_token_id
-                    ] * max(input_samples.shape[1] - len(tokenized), 0)
+                    ] * max(input_ids[input_idx].shape[0] - len(tokenized), 0)
+                    
+                    assert np.all(input_ids[input_idx] == input_ids_gen)
 
                 # The predictions are already encoded
                 prediction = content[entry_idx]["results"][k]
@@ -226,9 +231,11 @@ def _convert(
 
 
 class _ConvertFunctor:
-    def __init__(self, tokenizer, max_epochs):
+    def __init__(self, tokenizer, max_epochs, input_ids, label_ids):
         self._tokenizer = tokenizer
         self._max_epochs: Optional[int] = max_epochs
+        self._input_ids = input_ids
+        self._label_ids = label_ids
         if max_epochs:
             rich.print(f"[red]{max_epochs = }")
 
@@ -237,6 +244,8 @@ class _ConvertFunctor:
             input_path=input_path, 
             tokenizer=self._tokenizer, 
             max_epochs=self._max_epochs, 
+            input_ids=self._input_ids,
+            label_ids=self._label_ids,
             verbose=verbose, 
             queue=queue,
         )
@@ -260,15 +269,24 @@ def main(
     method=LaunchMethods.launch_pool,
     max_epochs: Optional[int] = 60,
     thread_or_process: str = ThreadOrProcess.process,
+    subset_path: PathType = DATA_DIR / "subsets/subset_10000_seed_453345_of_349_6_6_200000.json", 
+    data_path: PathType = DATA_DIR / "349_6_6_200000.json.pkl",
+    
 ):
     general_utils.check_and_print_args(locals().copy(), main)
+
+    assert data_path.suffix == ".pkl", f"{data_path} is not a pickle file."
+    assert subset_path.suffix == ".json", f"{subset_path} is not a json file."
+    assert subset_path.exists(), f"{subset_path} does not exist."
+    assert data_path.exists(), f"{data_path} does not exist."
+
 
     if thread_or_process == ThreadOrProcess.thread:
         thread_or_process_type = threading.Thread
     elif thread_or_process == ThreadOrProcess.process:
         thread_or_process_type = multiprocessing.Process
     else:
-        raise ValueError(f"Unknown thread_or_process: {thread_or_process}, should be one of {list(ThreadOrProcess)}")
+        raise ValueError(f"Unknown thread_or_process: {thread_or_process}, should be one of {[x.value for x in list(ThreadOrProcess)]}")
 
     method = LaunchMethods(method)
     tokenizer = data_tokenizer.ArithmeticTokenizer()
@@ -280,7 +298,7 @@ def main(
     path = Path(path)
     active = sorted(path.glob(f"**/{TARGET_FILE_NAME}"))
     
-    rich.print(f"[bold]Directories: {path}")
+    rich.print(f"[bold]File paths: {general_utils.shorten_path(path)}")
     for path in general_utils.sort_iterable_text(active):
         rich.print(f"\t- {general_utils.shorten_path(path)}")
     print()
@@ -289,29 +307,30 @@ def main(
     rich.print("[bold]Converting.")
     rich.print(f"{n_cpus = }")
     n_cpus = min(n_cpus, len(active))  # Likely already done by multiprocessing.Pool
-    functor = _ConvertFunctor(tokenizer, max_epochs=max_epochs)
 
-    print("Starting multiprocessing.")
+    ###########################################################################
+    # Prep the inputs and labels
+    ###########################################################################
+    print()
+    rich.print("[bold]Preparing inputs and labels.")
+    sorted_by_keys = script_add_label_info_to_subset_h5.build_eval_subset_sorted_by_keys(data_path, subset_path)
+    label_ids = script_add_label_info_to_subset_h5.tokenize_pad_numpify(
+        tokenizer, sorted_by_keys.values(), script_add_label_info_to_subset_h5.NODE_VALUE_STR_KEY
+    )
+    input_ids = script_add_label_info_to_subset_h5.tokenize_pad_numpify(tokenizer, sorted_by_keys.keys())
+
+    ###########################################################################
+    # Do the multiprocessing
+    ###########################################################################
+    print()
+    rich.print("[bold]Starting multiprocessing.")
+    functor = _ConvertFunctor(tokenizer, max_epochs=max_epochs, input_ids=input_ids, label_ids=label_ids)
     start = time.perf_counter()
     if not test_run:
-
-        if method == LaunchMethods.launch_all:
-            #######################################################################
-            # Launch all processes
-            #######################################################################
-            processes: list[thread_or_process_type] = []
-            for path in active:
-                process = thread_or_process_type(target=functor, args=(path, None,))
-                processes.append(process)
-                process.start()
-            
-            for process in tqdm(processes):
-                process.join()
-
-        elif method == LaunchMethods.launch_few:
-            #######################################################################
+        if method == LaunchMethods.launch_few:
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Only launch n_cpus processes
-            #######################################################################
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             processes: list[thread_or_process_type] = []  # type: ignore[no-redef]
             if thread_or_process_type == threading.Thread:
                 queue = threading_queue.Queue(n_cpus)
@@ -325,7 +344,7 @@ def main(
             for i, path in enumerate(tqdm(active, desc="Running jobs")):
                 queue.get()
                 print(f"Started {i}")
-                process = thread_or_process_type(target=functor, args=(path, queue,))
+                process = thread_or_process_type(target=functor, args=(path, queue))
                 processes.append(process)
                 process.start()
 

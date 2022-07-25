@@ -2,6 +2,7 @@ import collections
 import functools
 import inspect
 import itertools
+import math
 from pathlib import Path
 import subprocess
 
@@ -35,20 +36,29 @@ def shorten_path(path):
     return path
 
 def print_list(_list):
+    at_least_one = False
     for line in _list:
+        at_least_one = True
         if isinstance(line, Path):
             line = shorten_path(line)
         rich.print(f"\t- {line}")
 
+    if not at_least_one:
+        rich.print("\t[bright_black]<empty list>")
+
 def print_dict(_dict: dict[str, Any]) -> None:
     # Pad by key length
     max_len = len(max(_dict, key=lambda key: len(str(key)))) + 1
+    at_least_one = False
     for k, value in _dict.items():
+        at_least_one = True
         if isinstance(value, Path):
             value = shorten_path(value)
 
         rich.print(f"\t- {k} =" + (max_len - len(k)) * " " + f" {value}")
 
+    if not at_least_one:
+        rich.print("\t[bright_black]<empty dict>")
 
 def zip_dicts(*dicts):
     """

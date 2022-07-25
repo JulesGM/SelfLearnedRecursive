@@ -67,7 +67,8 @@ def tokenize_pad_numpify(tokenizer, strings: Union[Iterable[str], Mapping[Any, s
 
     return np.array(padded, dtype=np.int64)
 
-def work(predictions_h5_path, input_ids, subset_path, tokenizer, sorted_by_keys, queue: multiprocessing.Queue):
+
+def work(predictions_h5_path, input_ids, subset_path, labels_np, queue: multiprocessing.Queue):
 
     with h5py.File(predictions_h5_path, "r+") as predictions:
         assert predictions[H5_INPUT_IDS_KEY].shape[0] >= input_ids.shape[0], (
@@ -79,20 +80,52 @@ def work(predictions_h5_path, input_ids, subset_path, tokenizer, sorted_by_keys,
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute the labels and tokenize them, then save them.
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        labels_np = tokenize_pad_numpify(tokenizer, sorted_by_keys.values(), NODE_VALUE_STR_KEY)
         predictions.create_dataset(H5_LABEL_IDS_KEY, data=labels_np)
 
     queue.put(None)
 
 
+def build_eval_subset_sorted_by_keys(data_path, subset_path):
 
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Load the eval ds
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    start = time.perf_counter()
+    dataset_dict = pickle.loads(data_path.read_bytes())
+    end = time.perf_counter()
+    print(f"Loaded the pkl dataset in {end - start:.2f} seconds")
+    valid_ds = dataset_dict[MAIN_DATASET_DATA_KEY][MAIN_DATASET_EVAL_KEY]
+    del dataset_dict
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Load the subset file and apply it to the eval ds
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    subset_indices, subset_str = script_data_subset_selection.read_subset_file(
+        data_path, subset_path
+    )
+    valid_ds_subset = {}
+    for level, nodes in tqdm(valid_ds.items(), desc="Applying the subset"):
+        assert isinstance(level, int)
+        valid_ds_subset[level] = [nodes[idx] for idx in subset_indices[level]]
+    del valid_ds, subset_indices, subset_str
+    
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # extract the order of the nodes in the subset
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    subset_per_key = {}
+    for level, node_list in valid_ds_subset.items():
+        for node in node_list:
+            subset_per_key[node[NODE_INPUT_STR_KEY]] = node
+    sorted_by_keys = dict(sorted(subset_per_key.items(), key=lambda item: item[0]))
+    
+    return sorted_by_keys
 
 
 def main(
-    dir_path: PathType = SCRIPT_DIR / "log_results/oracle/",
+    dir_path: PathType = SCRIPT_DIR / "log_results/basic/",
     subset_path: PathType = DATA_DIR / "subsets/subset_10000_seed_453345_of_349_6_6_200000.json", 
     data_path: PathType = DATA_DIR / "349_6_6_200000.json.pkl",
-    num_procs: int = 6,
+    num_procs: int = 10,
     dry: bool = False,
     thread_or_process: str = "thread",
 ):
@@ -101,6 +134,10 @@ def main(
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     general_utils.check_and_print_args(locals().copy(), main)
 
+    assert thread_or_process == "thread", (
+        "Multiprocessing is useless it turns out, as the numpy work is only done once."
+    )
+    
     if thread_or_process == "thread":
         thread_or_process_type = threading.Thread
     else:
@@ -152,47 +189,28 @@ def main(
                 f"{subset_path} has a different number of samples than {predictions_h5_path}"
             )
 
-    
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Load the eval ds
+    # Get the labels ready.
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    rich.print("[bold]1. Loading the eval dataset ...")
+    tokenizer = data_tokenizer.ArithmeticTokenizer()
+    print()
+    rich.print("[bold]Prepare the subset.")
     start = time.perf_counter()
-    dataset_dict = pickle.loads(data_path.read_bytes())
+    sorted_by_keys = build_eval_subset_sorted_by_keys(data_path, subset_path)
     end = time.perf_counter()
-    print(f"Loaded the pkl dataset in {end - start:.2f} seconds")
-    valid_ds = dataset_dict[MAIN_DATASET_DATA_KEY][MAIN_DATASET_EVAL_KEY]
-    del dataset_dict
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Load the subset file and apply it to the eval ds
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    rich.print("\n[bold]2. Loading the subset file and applying it to the eval dataset ...")
-    subset_indices, subset_str = script_data_subset_selection.read_subset_file(
-        data_path, subset_path
-    )
-    valid_ds_subset = {}
-    for level, nodes in tqdm(valid_ds.items(), desc="Applying the subset"):
-        assert isinstance(level, int)
-        valid_ds_subset[level] = [nodes[idx] for idx in subset_indices[level]]
-    del valid_ds, subset_indices, subset_str
-    
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # extract the order of the nodes in the subset
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    rich.print("\n[bold]3. Extracting the order of the nodes in the subset ...")
-    subset_per_key = {}
-    for level, node_list in valid_ds_subset.items():
-        for node in node_list:
-            subset_per_key[node[NODE_INPUT_STR_KEY]] = node
-    sorted_by_keys = dict(sorted(subset_per_key.items(), key=lambda item: item[0]))
-    del subset_per_key
+    print(f"Built the subset in {end - start:.1f} seconds")
+    print()
+    rich.print("[bold]Prepare the labels.")
+    start = time.perf_counter()
+    labels_np = tokenize_pad_numpify(tokenizer, sorted_by_keys.values(), NODE_VALUE_STR_KEY)    
+    end = time.perf_counter()
+    print(f"Padded the labels in {end - start:.1f} seconds")
+    print()
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Make sure the order is the same in the predictions h5 file
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    rich.print("\n[bold]4. Make sure the order is the same in the predictions h5 file ...")
-    tokenizer = data_tokenizer.ArithmeticTokenizer()
+    rich.print("\n[bold]Make sure the order is the same in the predictions h5 file ...")
     input_ids = tokenize_pad_numpify(tokenizer, sorted_by_keys.keys())
 
     if thread_or_process_type == threading.Thread:
@@ -214,8 +232,7 @@ def main(
                 kwargs=dict(
                     input_ids=input_ids, 
                     subset_path=subset_path, 
-                    tokenizer=tokenizer, 
-                    sorted_by_keys=sorted_by_keys, 
+                    labels_np=labels_np, 
                     queue=queue
                 )
             )

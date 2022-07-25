@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
 
 print("Doing imports")
 import collections
@@ -69,6 +67,7 @@ def main(
     test_run=False,
 ):
     general_utils.check_and_print_args(locals().copy(), main)
+    
     if name == Modes.oracle:
         extract_pred_fn = extract_pred_oracle
     elif name == Modes.basic:
@@ -165,7 +164,6 @@ def main(
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     rich.print("[bold]Computing accuracies...")
     tokenizer = data_tokenizer.ArithmeticTokenizer()
-    accuracies = np.zeros((len(active), min_no), dtype=np.float64)
 
     labels = []
     for file in tqdm(files, desc="Decoding labels"):
@@ -174,6 +172,7 @@ def main(
             int(label)  # Labels should be valid integers. This "useless" conversion checks this.
             labels.append(label)
 
+    accuracies = np.zeros((len(active), min_no), dtype=np.float64)
     for epoch_idx in range(min_no):
         for file_idx, file in enumerate(files):
             values = []
@@ -182,7 +181,7 @@ def main(
                 maybe_pred_num = extract_pred_fn(pred_str)
                 values.append(maybe_pred_num == label)
             accuracies[file_idx, epoch_idx] = np.mean(values)
-        rich.print(f"{epoch_idx = }: {np.mean(accuracies[:, epoch_idx])}")
+        rich.print(f"{epoch_idx = }: {np.mean(accuracies[:, epoch_idx]):0.1%}")
     
     per_epoch_acc = np.mean(accuracies, axis=0)
     rich.print(f"Per epoch accuracy: {per_epoch_acc}")
@@ -200,11 +199,9 @@ def main(
             agreement = top[0][1] / len(text_samples)
             agreement_per_sample.append(agreement)
     
-        print(f"Epoch {epoch_idx} Agreement: {np.mean(agreement_per_sample):0.1%}")
+        print(f"Epoch {epoch_idx} Agreement: {np.mean(agreement_per_sample):0.1%}, Accuracy: {per_epoch_acc[epoch_idx]:0.1%}")
         agreement_per_epoch.append(np.mean(agreement_per_sample))
     print(f"Averaged agreement: {np.mean(agreement_per_epoch):0.1%}")
-
-
 
     if not test_run:
         validation_accuracy_per_epoch = []
