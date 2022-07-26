@@ -1,4 +1,5 @@
 import collections
+import h5py
 import functools
 import inspect
 import itertools
@@ -7,6 +8,7 @@ from pathlib import Path
 import subprocess
 
 from beartype.typing import *
+import numpy as np
 import rich
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -261,3 +263,47 @@ def to_human_size(size: int) -> str:
     exponent = int(math.log(size, 1000))
     mantissa = size / 1000 ** exponent
     return f"{mantissa:.2f} {SIZE_HUMAN_NAMES[exponent]}"
+
+def print_structure_h5(file_object: h5py.File):
+    work_stack = [(file_object, "")]
+    POSSIBLE_TYPES = (h5py.Dataset, h5py.Group, h5py.File)
+
+    all_text = []
+
+    while work_stack:
+
+        obj, parent_name = work_stack.pop()
+        assert isinstance(obj, (h5py.Group, h5py.Dataset, h5py.File))
+
+        if obj.name == "":
+            obj_name = "<root>"
+        else:
+            obj_name = obj.name
+        
+        if parent_name:    
+            name = parent_name + "/" + obj_name
+        else:
+            name = obj_name
+
+        message = f"\"{name}\": {type(obj).__name__}"
+        if isinstance(obj, h5py.Dataset):
+            message += f" {obj.shape} {obj.dtype}"
+        all_text.append(message)
+
+        if obj.attrs:
+            for k, v in obj.attrs.items():
+                message_attr = f"\t- {k}: {type(v).__name__}"
+                if isinstance(v, (str, int, float)):
+                    message_attr += f" value=\"{v}\""
+                elif isinstance(v, np.ndarray):
+                    message_attr += f" shape={v.shape} dtype={v.dtype}"
+                elif isinstance(v, (tuple, list, dict)):
+                    message_attr += f" {type(v)} {len(v)}"
+                all_text.append(message_attr)
+
+        if hasattr(obj, "items"):
+            assert isinstance(obj, (h5py.Group, h5py.File))
+            for key, value in obj.items():
+                work_stack.append((value, parent_name))
+
+    rich.print("\n".join(all_text))

@@ -20,7 +20,7 @@ import subprocess
 import time
 import re
 
-import beartype
+from beartype import beartype
 from beartype.typing import *
 import h5py  # type: ignore[import]
 import fire  # type: ignore[import]
@@ -71,6 +71,43 @@ def compute_accuracy(path, min_no, tokenizer, labels, extract_pred_fn) -> np.nda
 
     return accuracies, time.process_time() - start
 
+def compute_agreement(
+    epoch_idx: int,  # Small
+    tokenizer,   # Small
+    extract_pred_fn: Callable,  # Small
+    paths: List[Path],  # Small 
+    per_epoch_acc = None,  # Big (if not None), not currently used
+):
+    top_1_agreement_per_sample = []
+    pairwise_agreement_per_sample = []
+    files = [h5py.File(path, "r") for path in paths]
+    arrays = [file["predictions"][epoch_idx] for file in files]
+
+    for samples in zip(*arrays):
+        text_samples = [extract_pred_fn(tokenizer.decode(sample, ignore_special_symbols=True)) for sample in samples]
+        top = collections.Counter(text_samples).most_common(1)
+        top_1_agreement = top[0][1] / len(text_samples)
+        top_1_agreement_per_sample.append(top_1_agreement)
+        
+        pairwise_good = 0
+        pairwise_total = 0
+        for i in range(len(text_samples)):
+            for j in range(i + 1, len(text_samples)):
+                pairwise_good += text_samples[i] == text_samples[j]
+                pairwise_total += 1
+        
+        pairwise_agreement_per_sample.append(pairwise_good / pairwise_total)
+
+    # print(f"Epoch {epoch_idx}:")
+    # if per_epoch_acc:
+    #     print(f"\t- Accuracy:            {per_epoch_acc[epoch_idx]:0.1%}")
+    # print(f"\t- Pairwise Agreement:  {np.mean(pairwise_agreement_per_sample):0.1%}")
+    # print(f"\t- Top-1 Agreement:     {np.mean(top_1_agreement_per_sample):0.1%}")
+    # print()
+    
+    return top_1_agreement_per_sample, pairwise_agreement_per_sample
+
+
 class Modes(str, enum.Enum):
     oracle = "oracle"
     basic = "basic"
@@ -78,12 +115,13 @@ class Modes(str, enum.Enum):
 ########################################################################################
 # List the output files of an experiment
 ########################################################################################
+@beartype
 def main(
-    name=Modes.basic.value,
-    ignore_bads=True,
-    max_length=60,
-    test_run=False,
-    n_cpus=10,
+    name: str = Modes.basic.value,
+    ignore_bads: bool = True,
+    max_length: int = 60,
+    test_run: bool = False,
+    n_cpus: int = 12,
 ):
     general_utils.check_and_print_args(locals().copy(), main)
     
@@ -93,6 +131,9 @@ def main(
         extract_pred_fn = extract_pred_basic
     else:
         raise ValueError(f"Unknown name `{name}`, must be one of {list(Modes)}")
+
+    target_file = SCRIPT_DIR / f"agreement_{name}.h5"
+    assert not target_file.exists(), f"File {target_file} already exists."
 
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Find and filter the directory pathss
@@ -220,8 +261,6 @@ def main(
 
     rich.print(f"[bold]Perf analysis")
     rich.print(f"\t- Computation time: {computation_time}s")
-    rich.print(f"\t- Linear time: {np.sum(times)}s")
-    rich.print(f"\t- [bold]Improvement of {np.sum(times) / computation_time}x")
     print("{cpus_to_use} cpus used")
     print()
 
@@ -239,62 +278,62 @@ def main(
     #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     print()
     rich.print("[bold]Computing agreement.")
-    top_1_agreement_per_epoch = []
-    pairwise_agreement_per_epoch = []
-    for epoch_idx in tqdm(range(min_no), desc="Computing agreement scores per epoch"):
-        top_1_agreement_per_sample = []
-        pairwise_agreement_per_sample = []
-        arrays = [file["predictions"][epoch_idx] for file in files]
-        for samples in zip(*arrays):
-            text_samples = [extract_pred_fn(tokenizer.decode(sample, ignore_special_symbols=True)) for sample in samples]
-            top = collections.Counter(text_samples).most_common(1)
-            top_1_agreement = top[0][1] / len(text_samples)
-            top_1_agreement_per_sample.append(top_1_agreement)
-            
-            pairwise_good = 0
-            pairwise_total = 0
-            for i in range(len(text_samples)):
-                for j in range(i + 1, len(text_samples)):
-                    pairwise_good += text_samples[i] == text_samples[j]
-                    pairwise_total += 1
-            
-            pairwise_agreement_per_sample.append(pairwise_good / pairwise_total)
     
-        print(f"Epoch {epoch_idx}:")
-        print(f"\t- Accuracy:            {per_epoch_acc[epoch_idx]:0.1%}")
-        print(f"\t- Pairwise Agreement:  {np.mean(pairwise_agreement_per_sample):0.1%}")
-        print(f"\t- Top-1 Agreement:     {np.mean(top_1_agreement_per_sample):0.1%}")
-        print()
-        top_1_agreement_per_epoch.append(np.mean(top_1_agreement_per_sample))
-        pairwise_agreement_per_epoch.append(np.mean(pairwise_agreement_per_sample))
+    top_1_all = []
+    pairwise_all = []
+
+    start = time.perf_counter()
+    cpus_to_use = min(n_cpus, min_no)
+    with multiprocessing.Pool(cpus_to_use) as pool:
+        promises = []
+        for epoch_idx in range(min_no):
+            promises.append(pool.apply_async(
+                compute_agreement, 
+                (epoch_idx, tokenizer, extract_pred_fn, active,), 
+                dict(per_epoch_acc=None)
+            ))
+
+        for promise in tqdm(promises, desc="Computing agreement scores per epoch"):
+            top_1_agreement, pairwise_agreement = promise.get()
+            top_1_all.append(top_1_agreement)
+            pairwise_all.append(pairwise_agreement)
+
+    top_1_all = np.array(top_1_all, dtype=np.float64)
+    pairwise_all = np.array(pairwise_all, dtype=np.float64)
+
+    duration = time.perf_counter() - start
+    rich.print(f"[bold]Done computing agreement.[/bold]")
+    rich.print(f"\t- Computation time: {duration:0.0f}s")
+    rich.print(f"\t- CPUs used: {cpus_to_use}")
 
     print()
-    print(f"[bold]Averaged Top-1 Agreement: {np.mean(top_1_agreement_per_epoch):0.1%}")
-    print(f"[bold]Averaged Pairwise Agreement: {np.mean(pairwise_agreement_per_epoch):0.1%}")
+    rich.print(f"[bold]Averaged Top-1 Agreement: {np.mean(top_1_all):0.1%}")
+    rich.print(f"[bold]Averaged Pairwise Agreement: {np.mean(pairwise_all):0.1%}")
     print()
 
+    rich.print(f"[bold]Saving results to {target_file} ...")
     if not test_run:
-        with h5py.File(f"agreement_{name}.h5", "w") as f:
+        with h5py.File(target_file, "w") as f:
             f.attrs.update(dict(
                 files_used=[str(path) for path in active],
                 file_md5s=[md5sum(path) for path in active],
             ))
 
             f.create_dataset(
-                "top-1_agreement_per_sample", 
-                data=np.array(top_1_agreement_per_epoch, dtype=np.float64),
+                "top-1_all", 
+                data=top_1_all,
             )
 
             f.create_dataset(
-                "pairwise_agreement_per_sample", 
-                data=np.array(pairwise_agreement_per_epoch, dtype=np.float64),
+                "pairwise_all", 
+                data=pairwise_all, 
             )
 
             f.create_dataset(
                 "accuracy_per_epoch", 
-                data=np.array(accuracies, dtype=np.float64),
+                data=accuracies,
             )
-
+    rich.print("[bold]All done.")
 
 
 if __name__ == "__main__":

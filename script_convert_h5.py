@@ -259,8 +259,8 @@ class ThreadOrProcess(str, enum.Enum):
 
 @beartype
 def main(
-    path: Union[str, Path] = SCRIPT_DIR / "log_results/basic/",
-    n_cpus: int = 10,
+    path: Union[str, Path] = SCRIPT_DIR / "log_results/oracle/",
+    n_cpus: int = 12,
     test_run: bool = False,
     method=LaunchMethods.launch_pool,
     max_epochs: Optional[int] = 60,
@@ -310,9 +310,12 @@ def main(
     print()
     rich.print("[bold]Preparing inputs and labels.")
     sorted_by_keys = script_add_label_info_to_subset_h5.build_eval_subset_sorted_by_keys(data_path, subset_path)
+    
     label_ids = script_add_label_info_to_subset_h5.tokenize_pad_numpify(
         tokenizer, sorted_by_keys.values(), script_add_label_info_to_subset_h5.NODE_VALUE_STR_KEY
     )
+
+    print("3")
     input_ids = script_add_label_info_to_subset_h5.tokenize_pad_numpify(tokenizer, sorted_by_keys.keys())
 
     ###########################################################################

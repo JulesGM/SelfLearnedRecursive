@@ -90,9 +90,12 @@ def build_eval_subset_sorted_by_keys(data_path, subset_path):
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Load the eval ds
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    
     start = time.perf_counter()
-    dataset_dict = pickle.loads(data_path.read_bytes())
+    with open(data_path, "rb") as f:
+        dataset_dict = pickle.load(f)
     end = time.perf_counter()
+
     print(f"Loaded the pkl dataset in {end - start:.2f} seconds")
     valid_ds = dataset_dict[MAIN_DATASET_DATA_KEY][MAIN_DATASET_EVAL_KEY]
     del dataset_dict
