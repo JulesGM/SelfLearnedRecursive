@@ -1,5 +1,5 @@
 import collections
-import h5py
+import h5py  # type: ignore[import]
 import functools
 import inspect
 import itertools
@@ -99,6 +99,7 @@ def dict_unzip(list_of_dicts):
         for k in keys:
             dict_of_lists[k].append(ld[k])
     return dict_of_lists
+
 
 def concat_lists(lists):
     assert all(isinstance(l, list) for l in lists)

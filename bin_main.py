@@ -255,7 +255,7 @@ class _PLBart(pl.LightningModule):
         self,
         *,
         model: transformers.PreTrainedModel,
-        tokenizer: data_tokenizer.Tokenizer,
+        tokenizer: data_tokenizer.ArithmeticTokenizer,
         train_ds,
         eval_ds,
         train_batch_size: int,
@@ -592,15 +592,15 @@ class _PLBart(pl.LightningModule):
                         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                         # rich.print(f"[black bold]{mode} {'Freeform' if is_freeform else 'Not-Freeform'}:")
                         # rich.print(f'Inputs:\n[bright_cyan]"{print_cleaned_inputs}"')
-
+                        #
                         # if cleaned_decoder_input_ids:
                         #     rich.print(
                         #         f'Decoder Inputs:\n[bright_cyan]"{cleaned_decoder_input_ids}"'
                         #     )
-
+                        #
                         # rich.print(f'Gen:\n[bright_cyan]"{print_cleaned_gen}"')
                         # rich.print(f'Label:\n[bright_cyan]     "{print_cleaned_labels}"')
-
+                        #
                         # idx_colored_a, idx_colored_b = color_matching(
                         #     clean_pred, clean_label
                         # )
