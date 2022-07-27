@@ -71,7 +71,9 @@ OPMAP: Final[dict[str, Callable[[Union[str, int], Union[str, int]], str]]] = {
     "-": lambda x, y: str(int(x) - int(y)),
 }
 
-
+###############################################################################
+# Parse max tree depths from strings or ids
+###############################################################################
 def tree_depth_from_str(tree_string: str) -> int:
     """
     Computes the depth of an equation tree of the dataset.
@@ -112,44 +114,10 @@ def tree_depth_from_ids(ids: np.ndarray, tokenizer: data_tokenizer.ArithmeticTok
     return counts.max(axis=-1)
 
 
-def get_all_desc(root: "Node") -> Generator["Node", None, None]:
-    work_stack = [root]
-    while work_stack:
-        node = work_stack.pop()
-        yield node
-
-        if node.get_children():
-            work_stack.extend(node.get_children())
-
-
-def multiple_get_all_desc(iterable: Iterable["Node"]) -> Generator["Node", None, None]:
-    for node in iterable:
-        yield from get_all_desc(node)
-
-
-def all_nodes_have_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
-    for node in all_nodes:
-        if node.get_complexity_level() is None:
-            return False
-    return True
-
-
-def all_nodes_have_unique_ids(all_nodes: Iterable["Node"]) -> bool:
-    seen = set()
-    for node in all_nodes:
-        if id(node) in seen:
-            return False
-        seen.add(id(node))
-    return True
-
-
-def all_nodes_have_root_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
-    for node in all_nodes:
-        if node.get_root_complexity_level() is None:
-            return False
-    return True
-
-
+###############################################################################
+# Utilities to load the dataset and prep the entries for training or inference.
+# prep_input_data used to have more stuff I believe.
+###############################################################################
 @beartype
 def prep_input_data(
     tokenizer: data_tokenizer.Tokenizer,
@@ -249,6 +217,9 @@ def load_dataset(
     return output, config_obj
 
 
+###############################################################################
+# Node class
+###############################################################################
 class Node:
     __slots__ = (
         "_children",
@@ -595,6 +566,70 @@ class Node:
         return f"Node({self.get_oracle_str()})"
 
 
+###############################################################################
+# Node utility functions
+###############################################################################
+def get_all_desc(root: "Node") -> Generator["Node", None, None]:
+    """
+    Get all descendants of a node.
+    Travels in depth first order.
+    """
+    work_stack = [root]
+    while work_stack:
+        node = work_stack.pop()
+        yield node
+
+        if node.get_children():
+            work_stack.extend(node.get_children())
+
+
+def multiple_get_all_desc(iterable: Iterable["Node"]) -> Generator["Node", None, None]:
+    """
+    Get all descendants of an iterable containnig nodes.
+    """
+    for node in iterable:
+        yield from get_all_desc(node)
+
+
+def all_nodes_have_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
+    """
+    Check if all nodes have a complexity level.
+    """
+    for node in all_nodes:
+        if node.get_complexity_level() is None:
+            return False
+    return True
+
+
+def all_nodes_have_unique_ids(all_nodes: Iterable["Node"]) -> bool:
+    """
+    Name says it all.
+    """
+    seen = set()
+    for node in all_nodes:
+        if id(node) in seen:
+            return False
+        seen.add(id(node))
+    return True
+
+
+def all_nodes_have_root_complexity_levels(all_nodes: Iterable["Node"]) -> bool:
+    for node in all_nodes:
+        if node.get_root_complexity_level() is None:
+            return False
+    return True
+
+
+def set_childrens_root_complexity_level(root: Node) -> None:
+    assert root.get_complexity_level()
+    root_complexity_level = root.get_complexity_level()
+    for node in get_all_desc(root):
+        node.set_root_complexity_level(root_complexity_level)
+
+
+###############################################################################
+# Data generation functions.
+###############################################################################
 def generate(
     config,
     previous: list,
@@ -605,6 +640,8 @@ def generate(
     filter_lambda: Optional[Callable] = None,
 ) -> Generator["Node", None, None]:
     """
+    Where the data generation actually happens.
+
     qty_each_op is per direction
     """
     if qty_required == "all":
@@ -723,13 +760,6 @@ def filter_length(
             return False
 
     return True
-
-
-def set_childrens_root_complexity_level(root: Node) -> None:
-    assert root.get_complexity_level()
-    root_complexity_level = root.get_complexity_level()
-    for node in get_all_desc(root):
-        node.set_root_complexity_level(root_complexity_level)
 
 
 class FilterLengthFunctor:
@@ -879,6 +909,9 @@ def generate_data(
 
 
 class PredLogger:
+    """
+    Logger object for the self learned mode.
+    """
     __slots__ = (
         # "root",
         "level_accuracy",
@@ -967,6 +1000,10 @@ class EquationConfig:
 
         return config_obj
 
+
+###############################################################################
+# The script's entry point functions, `main` and `test`.
+###############################################################################
 class EntryPoints:
     @staticmethod
     @beartype
@@ -1040,7 +1077,7 @@ class EntryPoints:
 
 
     @staticmethod
-    def test():        
+    def test():
         tokenizer = data_tokenizer.ArithmeticTokenizer()
         
         class Entry:
