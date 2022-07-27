@@ -17,13 +17,17 @@ def main():
 
     for file in tqdm(files):
         with open(file, "rb") as f:
-            obj = pickle.load(f)a
+            obj = pickle.load(f)
+            
         print("Loaded data")
         print(obj["config"])
         config = argparse.Namespace(**obj["config"])
         obj["config"][
             "output_name"
-        ] = f"{config.max_total_length}_{config.max_answer_length}_{config.max_depth}_{config.max_qty_per_level}.json"
+        ] = (
+            f"{config.max_total_length}_{config.max_answer_length}_"
+            f"{config.max_depth}_{config.max_qty_per_level}.json"
+        )
 
         print("Saving data")
         with open(file, "wb") as f:

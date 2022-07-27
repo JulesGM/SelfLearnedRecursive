@@ -43,7 +43,7 @@ import time
 from typing import *
 
 from beartype import beartype
-import fire
+import fire  # type: ignore[import]
 import numpy as np
 
 try:
@@ -634,7 +634,7 @@ def generate(
     config,
     previous: list,
     all_previous: list,
-    qty_required: int,
+    qty_required: Union[int, str],
     complexity_level: int,
     name: str = "",
     filter_lambda: Optional[Callable] = None,
@@ -1041,10 +1041,10 @@ class EntryPoints:
         logging.basicConfig(level=logging.DEBUG)
 
         config = EquationConfig(
-            max_depth,
-            max_total_length,
-            max_answer_length,
-            max_qty_per_level,
+            max_depth=max_depth,
+            max_total_length=max_total_length,
+            max_answer_length=max_answer_length,
+            max_qty_per_level=max_qty_per_level,
         )
 
         per_set = generate_data(config)

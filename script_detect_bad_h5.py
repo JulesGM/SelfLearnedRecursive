@@ -28,7 +28,7 @@ import h5py  # type: ignore[import]
 import fire  # type: ignore[import]
 import more_itertools
 import numpy as np
-import pretty_traceback
+import pretty_traceback  # type: ignore[import]
 import rich
 import torch
 from tqdm import tqdm  # type: ignore[import]
@@ -52,18 +52,20 @@ def length_stats(h5):
     return lengths.mean(), lengths.std(), lengths.max()
 
 
-def detect_bads(h5_paths: list[Union[Path, str]], num_epochs: int) -> set[Path]:
-    h5_paths = [Path(h5_path) for h5_path in h5_paths]
+def detect_bads(h5_paths: Sequence[Union[Path, str]], num_epochs: int):
+    h5_paths = cast(Sequence[Path], [Path(h5_path) for h5_path in h5_paths])
     files = [h5py.File(path, "r") for path in h5_paths]
-    bad_ones = set()
 
     all_inputs_are_the_same = all([
         np.all(files[0][H5_INPUT_IDS_KEY][:num_epochs] == 
-        files[i][H5_INPUT_IDS_KEY][:num_epochs]) for i in range(len(files))
+        files[i][H5_INPUT_IDS_KEY][:num_epochs]) 
+        for i in range(len(files))
     ])
+    
     all_labels_are_the_same = all([
         np.all(files[0][H5_LABEL_IDS_KEY][:num_epochs] == 
-        files[i][H5_LABEL_IDS_KEY][:num_epochs]) for i in range(len(files))
+        files[i][H5_LABEL_IDS_KEY][:num_epochs]) 
+        for i in range(len(files))
     ])
 
     assert all_inputs_are_the_same
@@ -103,8 +105,6 @@ def detect_bads(h5_paths: list[Union[Path, str]], num_epochs: int) -> set[Path]:
     print()
     rich.print("[bold]Maxes:")
     rich.print(maxes)
-
-    return bad_ones
 
 
 @beartype
@@ -148,7 +148,10 @@ def main(
     general_utils.print_dict(dict(Counter(keys).items()))
 
     print()
-    rich.print(f"[bold]Don't have label_ids: [/bold]({len(dont_have_label_ids)}/{len(h5_paths)})")
+    rich.print(
+        f"[bold]Don't have label_ids: [/bold]"
+        f"({len(dont_have_label_ids)}/{len(h5_paths)})"
+    )
     general_utils.print_list(general_utils.sort_iterable_text(dont_have_label_ids))
     print()
 

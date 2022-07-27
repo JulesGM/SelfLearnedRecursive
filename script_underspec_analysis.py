@@ -27,7 +27,7 @@ import fire  # type: ignore[import]
 import matplotlib.pyplot as plt  # type: ignore[import]
 import more_itertools
 import numpy as np
-import pretty_traceback
+import pretty_traceback  # type: ignore[import]
 import rich
 from tqdm import tqdm  # type: ignore[import]
 
@@ -57,19 +57,23 @@ def extract_pred_oracle(string: str) -> Optional[int]:
 
 extract_pred_basic = extract_pred_oracle
 
-def compute_accuracy(path, min_no, tokenizer, labels, extract_pred_fn) -> np.ndarray:
+
+def compute_accuracy(path, min_no, tokenizer, labels, extract_pred_fn) -> tuple[np.ndarray, float]:
     start = time.process_time()
     accuracies = np.zeros(min_no, dtype=np.float64)
     with h5py.File(path, "r") as file:
         for epoch_idx in range(min_no):
             values = []
-            for label, pred in more_itertools.zip_equal(labels, file[H5_PREDICTIONS_KEY][epoch_idx]):
+            for label, pred in more_itertools.zip_equal(
+                labels, file[H5_PREDICTIONS_KEY][epoch_idx]):
+
                 pred_str = tokenizer.decode(pred, ignore_special_symbols=True)
                 maybe_pred_num = extract_pred_fn(pred_str)
                 values.append(maybe_pred_num == label)
             accuracies[epoch_idx] = np.mean(values)
 
     return accuracies, time.process_time() - start
+
 
 def compute_agreement(
     epoch_idx: int,  # Small

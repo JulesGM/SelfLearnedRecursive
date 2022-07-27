@@ -7,14 +7,9 @@ Should also be merged with that script at some point in the future.
 """
 
 import json
-import os
 from pathlib import Path
-import re
-import sys
 from typing import *
 
-from beartype import beartype
-import collections
 import fire  # type: ignore[import]
 import h5py  # type: ignore[import]
 import multiprocessing
@@ -26,61 +21,34 @@ import threading
 import time
 from tqdm import tqdm  # type: ignore[import]
 
-import data_generation_arithmetic
 import data_tokenizer
 import general_utils
 import script_data_subset_selection
+import script_convert_h5
 
 SCRIPT_DIR = Path(__file__).absolute().parent
-DATA_DIR = SCRIPT_DIR / "data"
-TARGET_FILE_NAME = "predictions.h5"
-
-H5_INPUT_IDS_KEY = "input_samples"
-H5_LABEL_IDS_KEY = "label_ids"
-H5_PREDICTIONS_KEY = "predictions"
-MAIN_DATASET_EVAL_KEY = "eval"
-MAIN_DATASET_DATA_KEY = "data"
-NODE_VALUE_STR_KEY = "value"
-NODE_INPUT_STR_KEY = "input_str"
-SUBSET_INPUT_IDS_KEY = "subset_ids"
-
 PathType = Union[str, Path]
 
-def find_last(str_: str, char: str) -> int:
-    assert len(char) == 1, f"\"{char}\""
-    return - 1 - str_[::-1].find(char)
 
-
-def tokenize_pad_numpify(tokenizer, strings: Union[Iterable[str], Mapping[Any, str]], key: Any = None, pad_to: Optional[int] = None) -> np.ndarray:
-    
-    if key:
-        take_fn = lambda x: x[key]
-    else:
-        take_fn = lambda x: x
-
-    tokenized = [tokenizer.encode(take_fn(x), no_eos=False, return_tensors=None) for x in strings]
-    
-    if pad_to is None:
-        pad_to = max(len(x) for x in tokenized)
-    
-    padded = [x + [tokenizer.pad_token_id] * (pad_to - len(x)) for x in tokenized]
-
-    return np.array(padded, dtype=np.int64)
-
-
-def work(predictions_h5_path, input_ids, subset_path, labels_np, queue: multiprocessing.Queue):
+def work(
+    predictions_h5_path, 
+    input_ids, 
+    subset_path, 
+    labels_np, 
+    queue: multiprocessing.Queue,
+):
 
     with h5py.File(predictions_h5_path, "r+") as predictions:
-        assert predictions[H5_INPUT_IDS_KEY].shape[0] >= input_ids.shape[0], (
-            predictions[H5_INPUT_IDS_KEY].shape[0], input_ids.shape[0])
-        assert (np.all(predictions[H5_INPUT_IDS_KEY][:, :input_ids.shape[1]] == input_ids) and 
-            np.all(predictions[H5_INPUT_IDS_KEY][:, input_ids.shape[1]:] == 0)), (
+        assert predictions[script_convert_h5.H5_INPUT_IDS_KEY].shape[0] >= input_ids.shape[0], (
+            predictions[script_convert_h5.H5_INPUT_IDS_KEY].shape[0], input_ids.shape[0])
+        assert (np.all(predictions[script_convert_h5.H5_INPUT_IDS_KEY][:, :input_ids.shape[1]] == input_ids) and 
+            np.all(predictions[script_convert_h5.H5_INPUT_IDS_KEY][:, input_ids.shape[1]:] == 0)), (
             f"{predictions_h5_path} has a different order of nodes than {subset_path}")
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Compute the labels and tokenize them, then save them.
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        predictions.create_dataset(H5_LABEL_IDS_KEY, data=labels_np)
+        predictions.create_dataset(script_convert_h5.H5_LABEL_IDS_KEY, data=labels_np)
 
     queue.put(None)
 
@@ -97,7 +65,7 @@ def build_eval_subset_sorted_by_keys(data_path, subset_path):
     end = time.perf_counter()
 
     print(f"Loaded the pkl dataset in {end - start:.2f} seconds")
-    valid_ds = dataset_dict[MAIN_DATASET_DATA_KEY][MAIN_DATASET_EVAL_KEY]
+    valid_ds = dataset_dict[script_convert_h5.MAIN_DATASET_DATA_KEY][script_convert_h5.MAIN_DATASET_EVAL_KEY]
     del dataset_dict
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -118,7 +86,7 @@ def build_eval_subset_sorted_by_keys(data_path, subset_path):
     subset_per_key = {}
     for level, node_list in valid_ds_subset.items():
         for node in node_list:
-            subset_per_key[node[NODE_INPUT_STR_KEY]] = node
+            subset_per_key[node[script_convert_h5.NODE_INPUT_STR_KEY]] = node
     sorted_by_keys = dict(sorted(subset_per_key.items(), key=lambda item: item[0]))
     
     return sorted_by_keys
@@ -126,8 +94,9 @@ def build_eval_subset_sorted_by_keys(data_path, subset_path):
 
 def main(
     dir_path: PathType = SCRIPT_DIR / "log_results/basic/",
-    subset_path: PathType = DATA_DIR / "subsets/subset_10000_seed_453345_of_349_6_6_200000.json", 
-    data_path: PathType = DATA_DIR / "349_6_6_200000.json.pkl",
+    subset_path: PathType = (script_convert_h5.DATA_DIR / 
+        "subsets/subset_10000_seed_453345_of_349_6_6_200000.json"), 
+    data_path: PathType = script_convert_h5.DATA_DIR / "349_6_6_200000.json.pkl",
     num_procs: int = 10,
     dry: bool = False,
     thread_or_process: str = "thread",
@@ -138,15 +107,16 @@ def main(
     general_utils.check_and_print_args(locals().copy(), main)
 
     assert thread_or_process == "thread", (
-        "Multiprocessing is useless it turns out, as the numpy work is only done once."
+        "Multiprocessing is useless it turns out, "
+        "as the numpy work is only done once."
     )
     
     if thread_or_process == "thread":
         thread_or_process_type = threading.Thread
     else:
-        thread_or_process_type = multiprocessing.Process
+        thread_or_process_type = multiprocessing.Process  # type: ignore[assignment]
 
-    targets = list(Path(dir_path).glob(f"**/{TARGET_FILE_NAME}"))
+    targets = list(Path(dir_path).glob(f"**/{script_convert_h5.TARGET_FILE_NAME}"))
     print()
     rich.print("[bold]Targets:")
     general_utils.print_list(general_utils.sort_iterable_text(targets))
@@ -159,7 +129,7 @@ def main(
     subset_path = Path(subset_path)
     data_path = Path(data_path)
     subset_size = sum(len(x) for x in json.loads(subset_path.read_text()
-        )[SUBSET_INPUT_IDS_KEY].values())
+        )[script_convert_h5.SUBSET_INPUT_IDS_KEY].values())
 
     assert data_path.exists(), f"Path {data_path} does not exist"
     assert data_path.is_file(), f"Path {subset_path} is not a file"
@@ -173,23 +143,27 @@ def main(
     # Checks relating to the predictions h5 file
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     for  predictions_h5_path in targets:
-        assert predictions_h5_path.exists(), f"{predictions_h5_path} does not exist"
-        assert predictions_h5_path.is_file(), f"Path {predictions_h5_path} is not a file"
-        assert predictions_h5_path.suffix == ".h5", f"Path {predictions_h5_path} is not a .h5 file"
+        assert predictions_h5_path.exists(), (
+            f"{predictions_h5_path} does not exist")
+        assert predictions_h5_path.is_file(), (
+            f"Path {predictions_h5_path} is not a file")
+        assert predictions_h5_path.suffix == ".h5", (
+            f"Path {predictions_h5_path} is not a .h5 file")
 
         with h5py.File(predictions_h5_path, "r+") as predictions:
         
-            if H5_LABEL_IDS_KEY in predictions:
-                del predictions[H5_LABEL_IDS_KEY]
+            if script_convert_h5.H5_LABEL_IDS_KEY in predictions:
+                del predictions[script_convert_h5.H5_LABEL_IDS_KEY]
 
-            assert H5_INPUT_IDS_KEY in predictions
-            assert not np.all(predictions[H5_INPUT_IDS_KEY][:] == 0)
+            assert script_convert_h5.H5_INPUT_IDS_KEY in predictions
+            assert not np.all(predictions[script_convert_h5.H5_INPUT_IDS_KEY][:] == 0)
 
-            assert H5_PREDICTIONS_KEY in predictions, (
-                f"{H5_PREDICTIONS_KEY} not in {predictions}"
+            assert script_convert_h5.H5_PREDICTIONS_KEY in predictions, (
+                f"{script_convert_h5.H5_PREDICTIONS_KEY} not in {predictions}"
             )
-            assert subset_size == predictions[H5_INPUT_IDS_KEY].shape[0], (
-                f"{subset_path} has a different number of samples than {predictions_h5_path}"
+            assert subset_size == predictions[script_convert_h5.H5_INPUT_IDS_KEY].shape[0], (
+                f"{subset_path} has a different number "
+                f"of samples than {predictions_h5_path}"
             )
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -205,7 +179,8 @@ def main(
     print()
     rich.print("[bold]Prepare the labels.")
     start = time.perf_counter()
-    labels_np = tokenize_pad_numpify(tokenizer, sorted_by_keys.values(), NODE_VALUE_STR_KEY)    
+    labels_np = script_convert_h5.tokenize_pad_numpify(
+        tokenizer, sorted_by_keys.values(), script_convert_h5.NODE_VALUE_STR_KEY)    
     end = time.perf_counter()
     print(f"Padded the labels in {end - start:.1f} seconds")
     print()
@@ -214,20 +189,24 @@ def main(
     # Make sure the order is the same in the predictions h5 file
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     rich.print("\n[bold]Make sure the order is the same in the predictions h5 file ...")
-    input_ids = tokenize_pad_numpify(tokenizer, sorted_by_keys.keys())
+    input_ids = script_convert_h5.tokenize_pad_numpify(tokenizer, sorted_by_keys.keys())
 
     if thread_or_process_type == threading.Thread:
-        queue = threading_queue.Queue(num_procs)
+        queue: threading_queue.Queue = threading_queue.Queue(num_procs)
     elif thread_or_process_type == multiprocessing.Process:    
-        queue = multiprocessing.Queue(num_procs)
+        queue: multiprocessing.Queue = multiprocessing.Queue(num_procs)  # type: ignore[no-redef]
     else:
-        raise ValueError(f"Unknown thread_or_process_type: {thread_or_process_type}")
+        raise ValueError(
+            f"Unknown thread_or_process_type: {thread_or_process_type}")
 
-    [queue.put(None) for _ in range(num_procs)]
+    for _ in range(num_procs):
+        queue.put(None)
 
     if not dry:
         processes = []
-        for predictions_h5_path in tqdm(targets, desc="Main work, writing the label sections."):
+        for predictions_h5_path in tqdm(
+            targets, desc="Main work, writing the label sections."):
+
             queue.get()
             proc = thread_or_process_type(
                 target=work, 
@@ -251,14 +230,20 @@ def main(
         rich.print("[bold]Final checks.")
         for predictions_h5_path in tqdm(targets, desc="Final checks"):
             with h5py.File(predictions_h5_path, "r") as f:
-                assert H5_INPUT_IDS_KEY in f, f"{H5_INPUT_IDS_KEY} not in {f}"
-                assert H5_PREDICTIONS_KEY in f, f"{H5_PREDICTIONS_KEY} not in {f}"
-                assert f[H5_INPUT_IDS_KEY].shape[0] == f[H5_PREDICTIONS_KEY].shape[1], (
-                    f"\n{predictions_h5_path = }\n{f[H5_INPUT_IDS_KEY].shape = }\n{f[H5_PREDICTIONS_KEY].shape[0] = }"
+                assert script_convert_h5.H5_INPUT_IDS_KEY in f, (
+                    f"{script_convert_h5.H5_INPUT_IDS_KEY} not in {f}")
+                assert script_convert_h5.H5_PREDICTIONS_KEY in f, (
+                    f"{script_convert_h5.H5_PREDICTIONS_KEY} not in {f}")
+                assert (f[script_convert_h5.H5_INPUT_IDS_KEY].shape[0] == 
+                    f[script_convert_h5.H5_PREDICTIONS_KEY].shape[1]), (
+                    f"\n{predictions_h5_path = }\n"
+                    f"{f[script_convert_h5.H5_INPUT_IDS_KEY].shape = }\n"
+                    f"{f[script_convert_h5.H5_PREDICTIONS_KEY].shape[0] = }"
                 )
-
-                assert not np.all(f[H5_INPUT_IDS_KEY][:] == 0), predictions_h5_path
-                assert not np.all(f[H5_PREDICTIONS_KEY][:] == 0), predictions_h5_path
+                assert not np.all(f[script_convert_h5.H5_INPUT_IDS_KEY][:] == 0), (
+                    predictions_h5_path)
+                assert not np.all(f[script_convert_h5.H5_PREDICTIONS_KEY][:] == 0), (
+                    predictions_h5_path)
 
     print("Done.")
 

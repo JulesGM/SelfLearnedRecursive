@@ -12,20 +12,15 @@ as epochs are just range(num_epochs) now.
 """
 
 import collections
-import concurrent.futures
 import enum
-import inspect
-import os
 import multiprocessing
 import multiprocessing.pool as mp_pool
 import queue as threading_queue
 import itertools
 from pathlib import Path
-import queue
 import subprocess
 import time
 import threading
-import traceback
 
 from beartype import beartype
 from beartype.typing import *
@@ -44,9 +39,40 @@ pretty_traceback.install()
 
 
 SCRIPT_DIR = Path(__file__).absolute().parent
+
 DATA_DIR = SCRIPT_DIR / "data"
+TARGET_FILE_NAME = "predictions.h5"
+H5_INPUT_IDS_KEY = "input_samples"
+H5_LABEL_IDS_KEY = "label_ids"
+H5_PREDICTIONS_KEY = "predictions"
+MAIN_DATASET_EVAL_KEY = "eval"
+MAIN_DATASET_DATA_KEY = "data"
+NODE_VALUE_STR_KEY = "value"
+NODE_INPUT_STR_KEY = "input_str"
+SUBSET_INPUT_IDS_KEY = "subset_ids"
 
 PathType = Union[Path, str]
+
+
+def tokenize_pad_numpify(
+    tokenizer, strings: Union[Iterable[str], Mapping[Any, str]], 
+    key: Any = None, 
+    pad_to: Optional[int] = None,
+) -> np.ndarray:
+    
+    if key:
+        take_fn = lambda x: x[key]
+    else:
+        take_fn = lambda x: x
+
+    tokenized = [tokenizer.encode(take_fn(x), no_eos=False, return_tensors=None) for x in strings]
+    
+    if pad_to is None:
+        pad_to = max(len(x) for x in tokenized)
+    
+    padded = [x + [tokenizer.pad_token_id] * (pad_to - len(x)) for x in tokenized]
+
+    return np.array(padded, dtype=np.int64)
 
 def _convert(
     input_path: Union[str, Path],
@@ -191,9 +217,11 @@ def _convert(
             ######################################################
 
             # If we're after the 0th epoch
-            # Then the saved keys should be the same as the keys of the current epoch
+            # Then the saved keys should be the same as the 
+            # keys of the current epoch
             for input_idx, k in enumerate(sorted_keys):
-                # Make sure that we're only adding keys if we're in the zeroth epoch
+                # Make sure that we're only adding keys if we're 
+                # in the zeroth epoch
                 if real_epoch == 0:
                     tokenized = tokenizer.encode(k, return_tensors=None)
                     input_ids_gen = tokenized + [
@@ -211,22 +239,26 @@ def _convert(
             epochs_seen_list.append(content[entry_idx]["epoch"])
 
         # Make sure that we only have one of each key
-        assert len(set(epochs_seen_list)) == len(epochs_seen_list), collections.Counter(epochs_seen_list)
-        assert epochs_seen_list == list(range(len(epochs_seen_list))), epochs_seen_list
+        assert len(set(epochs_seen_list)) == len(epochs_seen_list), (
+            collections.Counter(epochs_seen_list))
+        assert epochs_seen_list == list(range(len(epochs_seen_list))), (
+            epochs_seen_list)
 
         if verbose:
             rich.print("Writing attrs")
 
-        predictions.attrs.create("epochs", epochs_seen_list, dtype=np.int64)
+        predictions.attrs.create(
+            "epochs", epochs_seen_list, dtype=np.int64
+        )
         
     if verbose:
         rich.print("[bold]Done h5py.")
 
-    
     if queue:
         queue.put(None)
     
     return time.process_time() - start_time
+
 
 class _ConvertFunctor:
     def __init__(self, tokenizer, max_epochs, input_ids, label_ids):
@@ -253,9 +285,11 @@ class LaunchMethods(str, enum.Enum):
     launch_one = "launch_one"
     launch_pool = "launch_pool"
 
+
 class ThreadOrProcess(str, enum.Enum):
     thread = "thread"
     process = "process"
+
 
 @beartype
 def main(
@@ -271,6 +305,9 @@ def main(
 ):
     general_utils.check_and_print_args(locals().copy(), main)
 
+
+    data_path = Path(data_path)
+    subset_path = Path(subset_path)
     assert data_path.suffix == ".pkl", f"{data_path} is not a pickle file."
     assert subset_path.suffix == ".json", f"{subset_path} is not a json file."
     assert subset_path.exists(), f"{subset_path} does not exist."
@@ -278,11 +315,14 @@ def main(
 
 
     if thread_or_process == ThreadOrProcess.thread:
-        thread_or_process_type = threading.Thread
+        thread_or_process_type: TypeAlias = threading.Thread
     elif thread_or_process == ThreadOrProcess.process:
-        thread_or_process_type = multiprocessing.Process
+        thread_or_process_type: TypeAlias = multiprocessing.Process  # type: ignore[assignment, no-redef]
     else:
-        raise ValueError(f"Unknown thread_or_process: {thread_or_process}, should be one of {[x.value for x in list(ThreadOrProcess)]}")
+        raise ValueError(
+            f"Unknown thread_or_process: {thread_or_process}, "
+            f"should be one of {[x.value for x in list(ThreadOrProcess)]}"
+        )
 
     method = LaunchMethods(method)
     tokenizer = data_tokenizer.ArithmeticTokenizer()
@@ -309,32 +349,39 @@ def main(
     ###########################################################################
     print()
     rich.print("[bold]Preparing inputs and labels.")
-    sorted_by_keys = script_add_label_info_to_subset_h5.build_eval_subset_sorted_by_keys(data_path, subset_path)
+    sorted_by_keys = script_add_label_info_to_subset_h5.build_eval_subset_sorted_by_keys(
+        data_path, subset_path)
     
-    label_ids = script_add_label_info_to_subset_h5.tokenize_pad_numpify(
-        tokenizer, sorted_by_keys.values(), script_add_label_info_to_subset_h5.NODE_VALUE_STR_KEY
+    label_ids = tokenize_pad_numpify(
+        tokenizer, sorted_by_keys.values(),
+        NODE_VALUE_STR_KEY
     )
 
     print("3")
-    input_ids = script_add_label_info_to_subset_h5.tokenize_pad_numpify(tokenizer, sorted_by_keys.keys())
+    input_ids = tokenize_pad_numpify(tokenizer, sorted_by_keys.keys())
 
     ###########################################################################
     # Do the multiprocessing
     ###########################################################################
     print()
     rich.print("[bold]Starting multiprocessing.")
-    convert_functor = _ConvertFunctor(tokenizer, max_epochs=max_epochs, input_ids=input_ids, label_ids=label_ids)
+    convert_functor = _ConvertFunctor(
+        tokenizer, 
+        max_epochs=max_epochs, 
+        input_ids=input_ids, 
+        label_ids=label_ids,
+    )
     start = time.perf_counter()
     if not test_run:
         if method == LaunchMethods.launch_few:
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             # Only launch n_cpus processes
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            processes: list[thread_or_process_type] = []  # type: ignore[no-redef]
+            processes: list[thread_or_process_type] = []
             if thread_or_process_type == threading.Thread:
-                queue = threading_queue.Queue(n_cpus)
+                queue: threading_queue.Queue = threading_queue.Queue(n_cpus)
             elif thread_or_process_type == multiprocessing.Process:
-                queue = multiprocessing.Queue(n_cpus)
+                queue: multiprocessing.Queue = multiprocessing.Queue(n_cpus)  # type: ignore[no-redef]
             else:
                 raise ValueError(thread_or_process_type)
 
@@ -343,7 +390,8 @@ def main(
             for i, path in enumerate(tqdm(active, desc="Running jobs")):
                 queue.get()
                 print(f"Started {i}")
-                process = thread_or_process_type(target=convert_functor, args=(path, queue))
+                process = thread_or_process_type(
+                    target=convert_functor, args=(path, queue))
                 processes.append(process)
                 process.start()
 
@@ -357,7 +405,7 @@ def main(
             if thread_or_process_type == threading.Thread:
                 PoolType = mp_pool.ThreadPool
             elif thread_or_process_type == multiprocessing.Process:
-                PoolType = multiprocessing.Pool
+                PoolType = multiprocessing.Pool  # type: ignore[assignment]
             
             promises = []
             times = []
