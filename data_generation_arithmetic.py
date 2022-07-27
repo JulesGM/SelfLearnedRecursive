@@ -2,24 +2,25 @@
 # coding: utf-8
 """
 Generate a dataset for the artihmetic dataset.
+
+Usage: data_generation_arithmetic.py main 
+
 """
-from beartype.typing import *
 
 import collections
 import copy
-import concurrent.futures as futures
 import dataclasses
 import logging
 import math
 from pathlib import Path
 import pickle
 import time
+from typing import *
 
 from beartype import beartype
+import fire
+import numpy as np
 import pretty_traceback  # type: ignore
-
-pretty_traceback.install()
-
 import random
 import rich
 from tqdm import tqdm  # type: ignore
@@ -28,13 +29,13 @@ import orjson as json
 import general_utils
 import data_tokenizer
 
-import numpy as np
 
+pretty_traceback.install()
 LOGGER = logging.getLogger(__name__)
 DEBUG = True
 SCRIPT_DIR = Path(__file__).absolute().parent
 
-opmap = {
+OPMAP: Final[dict[str, Callable[[Union[str, int], Union[str, int]], str]]] = {
     "+": lambda x, y: str(int(x) + int(y)),
     "*": lambda x, y: str(int(x) * int(y)),
     "-": lambda x, y: str(int(x) - int(y)),
@@ -42,7 +43,16 @@ opmap = {
 
 
 def tree_depth_from_str(tree_string: str) -> int:
+    """
+    Computes the depth of an equation tree of the dataset.
+    Does a cumulative sum where `(` are ones and `)` are -1,
+    and returns the max of the resulting array.
+
+    The `from_ids` version is much faster.
+    """
+
     assert isinstance(tree_string, str)
+
     bool_test = np.fromiter(
         (char == "(" for char in tree_string if char in ["(", ")"]), np.int64
     )
@@ -53,17 +63,19 @@ def tree_depth_from_str(tree_string: str) -> int:
     return val
 
 
-def tree_depth_from_ids(ids: List[int], tokenizer) -> int:
-    return tree_depth_from_str(
-        tokenizer.decode(ids, False).split(tokenizer.eos_token, 1)[0]
-    )
+def tree_depth_from_ids(ids: np.ndarray, tokenizer: data_tokenizer.ArithmeticTokenizer):
+    if not isinstance(ids, np.ndarray):
+        ids = np.array(ids)
 
+    lparen_idx = tokenizer.token_to_idx["("]
+    rparen_idx = tokenizer.token_to_idx[")"]
+    up_downs = ids.copy()
+    up_downs[ids == lparen_idx] = 1
+    up_downs[ids == rparen_idx] = -1
+    up_downs[np.logical_and(ids != lparen_idx, ids != rparen_idx)] = 0
+    counts = up_downs.cumsum(axis=-1)
 
-def tree_depth_from_ids_batch(ids: List[int], tokenizer) -> List[int]:
-    decoded_and_cleaned = [
-        tokenizer.decode(x, False).split(tokenizer.eos_token, 1)[0] for x in ids
-    ]
-    return [tree_depth_from_str(x) for x in decoded_and_cleaned]
+    return counts.max(axis=-1)
 
 
 def get_all_desc(root: "Node") -> Generator["Node", None, None]:
@@ -109,7 +121,7 @@ def prep_input_data(
     tokenizer: data_tokenizer.Tokenizer,
     input_str: str,
     pseudo_without_head: str,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     input_ids = tokenizer(input_str, return_tensors="np", no_eos=False)
     decoder_input_ids = tokenizer(pseudo_without_head, return_tensors="np", no_eos=False)
 
@@ -122,7 +134,7 @@ def prep_input_data(
 
 def load_dataset(
     json_path: Union[str, Path], pkl_path: Union[str, Path], splits=None,
-) -> Tuple[DefaultDict[str, DefaultDict[int, list["Node"]]], "EquationConfig"]:
+) -> tuple[DefaultDict[str, DefaultDict[int, list["Node"]]], "EquationConfig"]:
     LOGGER.debug(f"Reading and parsing dataset from {json_path} or from {pkl_path}")
 
     ACCEPTABLE_SPLITS = {"train", "eval"}
@@ -577,7 +589,7 @@ def generate(
                 new_node = Node(
                     op=op,
                     children=[a, b],
-                    value=opmap[op](a.get_value(), b.get_value()),
+                    value=OPMAP[op](a.get_value(), b.get_value()),
                     complexity_level=complexity_level,
                 )
                 if filter_lambda is not None:
@@ -640,7 +652,7 @@ def generate(
                 new_node = Node(
                     op=op,
                     children=[sub_node_a, sub_node_b],
-                    value=opmap[op](sub_node_a.get_value(), sub_node_b.get_value()),
+                    value=OPMAP[op](sub_node_a.get_value(), sub_node_b.get_value()),
                     complexity_level=complexity_level,
                 )
                 uniqe_roots.append(new_node)
@@ -718,9 +730,9 @@ def zeroth_level(config):
 
 
 def first_level_and_more(
-    config,
-    qty,
-    complexity_level,
+    config: "EquationConfig",
+    qty: int,
+    complexity_level: int,
     split_previous,
     all_split_previous,
     filter_length_lambda,
@@ -859,6 +871,7 @@ class PredLogger:
 class EquationConfig:
     # misc
 
+    @beartype
     def __init__(
         self,
         *,
@@ -920,45 +933,67 @@ class EquationConfig:
 
         return config_obj
 
+class EntryPoints:
+    @staticmethod
+    @beartype
+    def main(
+        max_depth: int = 6,
+        max_total_length: int = 349,
+        max_answer_length: int = 6,
+        max_qty_per_level: int = 200000,
+    ):
+        # create basic config for logging
+        logging.basicConfig(level=logging.DEBUG)
 
-def main():
-    # create basic config for logging
-    logging.basicConfig(level=logging.DEBUG)
+        config = EquationConfig(
+            max_depth,
+            max_total_length,
+            max_answer_length,
+            max_qty_per_level,
+        )
 
-    config = EquationConfig(
-        max_depth=6,
-        max_total_length=349,
-        max_answer_length=6,
-        max_qty_per_level=200000,
-    )
-    per_set = generate_data(config)
+        per_set = generate_data(config)
 
-    print("Building the dict object that will be saved.")
-    dataset = {"data": {}, "config": config.to_json_dict()}
-    data = dataset["data"]
-    for split, nodes_per_level in per_set.items():
-        data[split] = {}
-        split_dict = data[split]
-        for level_name, nodes_per_level in nodes_per_level.items():
-            assert level_name != 0, level_name
-            split_dict[level_name] = [
-                sample.to_json_dict()
-                for sample in tqdm(
-                    nodes_per_level, desc=f"Split {split} Level {level_name}"
-                )
-            ]
+        print("Building the dict object that will be saved.")
+        dataset = {"data": {}, "config": config.to_json_dict()}
+        data = dataset["data"]
+        for split, nodes_per_level in per_set.items():
+            data[split] = {}
+            split_dict = data[split]
+            for level_name, nodes_per_level in nodes_per_level.items():
+                assert level_name != 0, level_name
+                split_dict[level_name] = [
+                    sample.to_json_dict()
+                    for sample in tqdm(
+                        nodes_per_level, desc=f"Split {split} Level {level_name}"
+                    )
+                ]
 
-    print("Saving the data.")
-    start = time.perf_counter()
-    with open(SCRIPT_DIR / "data" / f"{config.output_name}.pkl", "bw") as f:
-        pickle.dump(dataset, f)
-    print(f"Pickled dicts in {time.perf_counter() - start:0.2f} seconds")
+        print("Saving the data.")
+        start = time.perf_counter()
+        with open(SCRIPT_DIR / "data" / f"{config.output_name}.pkl", "bw") as f:
+            pickle.dump(dataset, f)
+        print(f"Pickled dicts in {time.perf_counter() - start:0.2f} seconds")
 
-    start = time.perf_counter()
-    with open(SCRIPT_DIR / "data" / config.output_name, "w") as f:
-        f.write(json.dumps(dataset, indent=4))
-    print(f"Dumped json in {time.perf_counter() - start:0.2f} seconds")
+        start = time.perf_counter()
+        with open(SCRIPT_DIR / "data" / config.output_name, "w") as f:
+            f.write(json.dumps(dataset, indent=4))
+        print(f"Dumped json in {time.perf_counter() - start:0.2f} seconds")
+
+
+    @staticmethod
+    def test():        
+        tokenizer = data_tokenizer.ArithmeticTokenizer()
+        test_str = "(((1 + 2) * 3) - (3 + (2 - 1)))"
+        ids = tokenizer.encode(test_str, return_tensors=None)
+        tree_depth_from_str(test_str)
+        old = tree_depth_from_ids_old(ids, tokenizer)
+        new = tree_depth_from_ids(ids, tokenizer)
+        assert old == new, (old, new)
+        old_array = tree_depth_from_ids_batch_old([ids, ids, ids, ids], tokenizer)
+        new_array = tree_depth_from_ids(np.array([ids, ids, ids, ids]), tokenizer)
+        assert np.all(old_array == new_array), (old_array, new_array)
 
 
 if __name__ == "__main__":
-    main()
+    fire.Fire(EntryPoints)
