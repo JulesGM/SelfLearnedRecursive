@@ -55,7 +55,7 @@ except ImportError:
 import random
 import rich
 from tqdm import tqdm  # type: ignore
-import orjson as json
+import json
 
 import general_utils
 import data_tokenizer
@@ -1050,7 +1050,7 @@ class EntryPoints:
         per_set = generate_data(config)
 
         print("Building the dict object that will be saved.")
-        dataset = {"data": {}, "config": config.to_json_dict()}
+        dataset: dict[str, dict[str, Any]] = {"data": {}, "config": config.to_json_dict()}
         data = dataset["data"]
         for split, nodes_per_level in per_set.items():
             data[split] = {}
