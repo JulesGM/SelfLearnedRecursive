@@ -100,11 +100,6 @@ def dict_unzip(list_of_dicts):
             dict_of_lists[k].append(ld[k])
     return dict_of_lists
 
-
-def find_last(seq, item):
-    return len(seq) - seq[::-1].index(item) - 1
-
-
 def concat_lists(lists):
     assert all(isinstance(l, list) for l in lists)
     return sum(lists, [])
