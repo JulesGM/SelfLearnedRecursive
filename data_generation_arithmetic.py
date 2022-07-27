@@ -3,7 +3,32 @@
 """
 Generate a dataset for the artihmetic dataset.
 
-Usage: data_generation_arithmetic.py main 
+Usage: data_generation_arithmetic.py main [kwargs]
+
+Args:
+
+    --max_depth (default 6): 
+        How deep the equations can go. This guarantees that at 
+    least one path from root to leaf will be that long.
+
+    --max_total_length (default 349):
+        The maximum length of the *label* in number of tokens. 
+    If a generated entry is shorter, it will be ignored and a
+    new one will be generated.
+
+    --max_answer_length (default 6):
+        The maximum length of a value in number of tokens.
+    This can be the final value or the intermediate value.
+
+    --max_qty_per_level (default 200000):
+        Number of data points to generate per equation depth level.
+
+The dataset can be loaded with `load_dataset`.
+
+If you just want to experiment with this dataset, you should probably
+pre-tokenize the entries and save them to HDF5, calling
+`Node.get_input_str` to get the equations, and `Node.get_value` on
+the top level strings to get non recursive values.
 
 """
 
@@ -20,7 +45,13 @@ from typing import *
 from beartype import beartype
 import fire
 import numpy as np
-import pretty_traceback  # type: ignore
+
+try:
+    import pretty_traceback  # type: ignore
+    pretty_traceback.install()
+except ImportError:
+    pass
+
 import random
 import rich
 from tqdm import tqdm  # type: ignore
@@ -30,7 +61,6 @@ import general_utils
 import data_tokenizer
 
 
-pretty_traceback.install()
 LOGGER = logging.getLogger(__name__)
 DEBUG = True
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -48,7 +78,8 @@ def tree_depth_from_str(tree_string: str) -> int:
     Does a cumulative sum where `(` are ones and `)` are -1,
     and returns the max of the resulting array.
 
-    The `from_ids` version is much faster.
+    The `from_ids` version is *considerably* faster, 
+    being vectorized.
     """
 
     assert isinstance(tree_string, str)
@@ -65,10 +96,13 @@ def tree_depth_from_str(tree_string: str) -> int:
 
 def tree_depth_from_ids(ids: np.ndarray, tokenizer: data_tokenizer.ArithmeticTokenizer):
     if not isinstance(ids, np.ndarray):
-        ids = np.array(ids)
+        ids = np.array(ids, np.float64)
+
+    assert ids.dtype == np.int64, ids.dtype
 
     lparen_idx = tokenizer.token_to_idx["("]
     rparen_idx = tokenizer.token_to_idx[")"]
+    
     up_downs = ids.copy()
     up_downs[ids == lparen_idx] = 1
     up_downs[ids == rparen_idx] = -1
@@ -942,6 +976,30 @@ class EntryPoints:
         max_answer_length: int = 6,
         max_qty_per_level: int = 200000,
     ):
+        """
+        Generate a dataset for the artihmetic dataset.
+
+        Usage: data_generation_arithmetic.py main [kwargs]
+
+        Args:
+
+            --max_depth (default 6): 
+                How deep the equations can go. This guarantees that at 
+            least one path from root to leaf will be that long.
+
+            --max_total_length (default 349):
+                The maximum length of the *label* in number of tokens. 
+            If a generated entry is shorter, it will be ignored and a
+            new one will be generated.
+
+            --max_answer_length (default 6):
+                The maximum length of a value in number of tokens.
+            This can be the final value or the intermediate value.
+
+            --max_qty_per_level (default 200000):
+                Number of data points to generate per equation depth level.
+
+        """
         # create basic config for logging
         logging.basicConfig(level=logging.DEBUG)
 
@@ -984,15 +1042,66 @@ class EntryPoints:
     @staticmethod
     def test():        
         tokenizer = data_tokenizer.ArithmeticTokenizer()
-        test_str = "(((1 + 2) * 3) - (3 + (2 - 1)))"
-        ids = tokenizer.encode(test_str, return_tensors=None)
-        tree_depth_from_str(test_str)
-        old = tree_depth_from_ids_old(ids, tokenizer)
-        new = tree_depth_from_ids(ids, tokenizer)
-        assert old == new, (old, new)
-        old_array = tree_depth_from_ids_batch_old([ids, ids, ids, ids], tokenizer)
-        new_array = tree_depth_from_ids(np.array([ids, ids, ids, ids]), tokenizer)
-        assert np.all(old_array == new_array), (old_array, new_array)
+        
+        class Entry:
+            equation_str: str
+            ids: List[int]
+            answer: int
+
+            def __init__(self, equation_str, answer, tokenizer):
+                self.equation_str = equation_str
+                self.answer = answer
+                self.ids = tokenizer.encode(equation_str)
+
+        def pad(ids_arrays, pad_token_id):
+            maxlen = max([len(ids) for ids in ids_arrays])
+            concatenated = [np.concatenate(
+                (ids, [pad_token_id] * (maxlen - len(ids)))) 
+                for ids in ids_arrays]
+            assert np.all([len(x) == len(concatenated[0]) 
+                for x in concatenated[1:]]), [len(x) for x in concatenated]
+            return np.array(concatenated, dtype=np.int64)
+
+        entries = [
+            Entry(
+                "(((1 + 2) * 3) - (3 + (2 - 1)))",
+                3,
+                tokenizer
+            ),
+            Entry(
+                "((1 + 2 * 3) - (3 + 2 - 100) + (3 * 2) * (1  + ((1 - 2) + -333 )))",
+                4,
+                tokenizer
+            ),
+            Entry(
+                "((1  + ((1 - (2 + (3 - 10))) + -3 ) * (1 + 2 * 3) - (3 + 2 - 1) + (3 * 2)))",
+                6,
+                tokenizer
+            ),
+        ]       
+
+        for entry in entries:
+            from_str = tree_depth_from_str(entry.equation_str)
+            from_ids = tree_depth_from_ids(entry.ids, tokenizer)
+            assert entry.answer == from_ids, (entry.answer, from_ids)
+            assert entry.answer == from_str, (entry.answer, from_str)
+    
+        for _ in range(10):
+            shuffled = entries.copy()
+            random.shuffle(shuffled)
+
+            ids = [x.ids for x in shuffled]
+            ids = pad(ids, tokenizer.pad_token_id)
+
+            answers = np.array([x.answer for x in shuffled], dtype=np.int64)
+            from_ids_array = tree_depth_from_ids(
+                ids, 
+                tokenizer
+            )
+            
+            assert np.all(from_ids_array == answers), (
+                f"{from_ids_array = }, {answers = }"
+            )
 
 
 if __name__ == "__main__":
