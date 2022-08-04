@@ -104,6 +104,20 @@ class Tokenizer:
 
         return " ".join(output)
 
+    def pad_array(self, ids_arrays):
+        """
+        Just pads the list of ids, doesn't try to replicate the 
+        pad function of the Huggingface Tokenizers.
+        """
+        maxlen = max([len(ids) for ids in ids_arrays])
+        concatenated = [np.concatenate(
+            (ids, [self.pad_token_id] * (maxlen - len(ids)))) 
+            for ids in ids_arrays]
+        assert np.all([len(x) == len(concatenated[0]) 
+            for x in concatenated[1:]]), [len(x) for x in concatenated]
+
+        return np.array(concatenated, dtype=np.int64)
+
     def pad(
         self,
         features,

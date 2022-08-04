@@ -6,9 +6,7 @@ print("Importing modules.")
 from beartype.typing import *
 
 import collections
-import dataclasses
 import graphlib
-import inspect  # Only used for tests
 import itertools
 import logging
 import math
@@ -18,7 +16,9 @@ import re
 import time
 
 from beartype import beartype
-import fire  # type: ignore
+import h5py  # type: ignore[import]
+import fire  # type: ignore[import]
+import json  # type: ignore[import]
 import jsonlines as jsonl  # type: ignore
 import more_itertools
 import numpy as np
@@ -28,12 +28,6 @@ import rich
 import torch
 from tqdm import tqdm  # type: ignore
 import transformers
-
-try:
-    import ujson as json
-except ImportError:
-    import json  # type: ignore[no-redef]
-    
 import wandb
 
 import pretty_traceback  # type: ignore
@@ -48,6 +42,7 @@ import general_shared_constants
 import general_utils
 import our_metrics
 import script_data_subset_selection
+import script_convert_h5
 print("Done loading modules.\n")
 
 
@@ -81,6 +76,8 @@ GENERATION_KWARGS = dict(
     min_length=0,
     constraints=None,
     do_sample=False,
+
+    tgt_array_indices=None
 )
 
 # Stuff that should never change
@@ -99,7 +96,7 @@ def generate(model: transformers.PreTrainedModel, **kwargs):
         assert GENERATION_KWARGS[k] == kwargs[k], f"{k} mismatch"
 
     assert "max_length" in kwargs, "max_length not in kwargs"
-
+    
     return model.generate(**kwargs)
 
 
@@ -309,6 +306,7 @@ class _PLBart(pl.LightningModule):
         self._do_log_results: Final[bool] = do_log_results
         self._path_log_results: Final[Optional[Path]] = path_log_results
         self._results_to_log: Optional[dict[str, dict[bool, dict[str, torch.Tensor]]]] = {}
+        self._labels_to_log: dict[str, str] = {}
 
         ################################################################################
         # Specific to the optimizer, its scheduler
@@ -372,7 +370,16 @@ class _PLBart(pl.LightningModule):
             kwargs_filtered["decoder_input_ids"][:, 0]
             == self._model.config.decoder_start_token_id
         )
-        return self._model(**kwargs_filtered)
+        
+        if "decoder_position_ids" not in kwargs_filtered:
+            kwargs_filtered["decoder_position_ids"] = None
+
+        if "tgt_array_indices" not in kwargs_filtered:
+            kwargs_filtered["tgt_array_indices"] = None
+
+        return self._model(
+            **kwargs_filtered
+        )
 
     def training_step(self, batch, batch_idx):
         outputs = self(**batch)
@@ -385,6 +392,7 @@ class _PLBart(pl.LightningModule):
         loss: torch.Tensor = self(**batch).loss
         things_to_log = dict(eval_loss=loss)
         per_batch_preds = None
+        per_batch_labels = None
         self._model: transformers.PreTrainedModel = self._model.eval()  # type: ignore[no-redef]
 
         #######################################################################
@@ -395,6 +403,7 @@ class _PLBart(pl.LightningModule):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         if ValidModes.per_batch in ACTIVE_MODES:
             per_batch_preds = {}
+            
             for is_freeform in self._freeform_options:
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Prep the argumetns.
@@ -453,6 +462,7 @@ class _PLBart(pl.LightningModule):
 
         big_counter = []
         preds: DefaultDict[str, dict[bool, dict[str, torch.Tensor]]] = collections.defaultdict(dict)
+        
         for i, pack in enumerate(
             tqdm(general_utils.zip_dicts(batch), desc="Validating", total=len(batch["input_ids"]))
         ):
@@ -525,6 +535,7 @@ class _PLBart(pl.LightningModule):
                     pred_per_mode[ValidModes.per_batch] = per_batch_pred
 
                 preds[idents[i]][is_freeform] = pred_per_mode
+                assert ValidModes.per_batch in ACTIVE_MODES
 
                 for mode, pred in pred_per_mode.items():
                     cleaned = our_metrics.OurMetric.prepare(
@@ -558,14 +569,14 @@ class _PLBart(pl.LightningModule):
                         # rich.print("Raw Pred:\n", pred)
                         # rich.print("Raw `labels`:\n", sample["labels"])
 
-                        print_cleaned_inputs = clean_sample_for_logging(
-                            sample["input_ids"], self._tokenizer
-                        )
-                        print_cleaned_labels = clean_sample_for_logging(
-                            sample["labels"], self._tokenizer
-                        )
-                        print_cleaned_gen = clean_sample_for_logging(pred, self._tokenizer)
-                        print_cleaned_decoder_input_ids = None
+                        # print_cleaned_inputs = clean_sample_for_logging(
+                        #     sample["input_ids"], self._tokenizer
+                        # )
+                        # print_cleaned_labels = clean_sample_for_logging(
+                        #     sample["labels"], self._tokenizer
+                        # )
+                        # print_cleaned_gen = clean_sample_for_logging(pred, self._tokenizer)
+                        # print_cleaned_decoder_input_ids = None
 
                         if "decoder_input_ids" in generation_kwargs:
                             if mode == ValidModes.per_sample:
@@ -617,7 +628,8 @@ class _PLBart(pl.LightningModule):
                     if not (mode == ValidModes.per_sample and is_freeform):
                         # TODO: This is slow but it is precise.
                         
-                        level = data_generation_arithmetic.tree_depth_from_ids(sample["input_ids"], self._tokenizer)
+                        level = data_generation_arithmetic.tree_depth_from_ids(
+                            sample["input_ids"], self._tokenizer)
                         big_counter.append(level)
 
                         assert level > 0, level
@@ -692,7 +704,48 @@ class _PLBart(pl.LightningModule):
         self._model = self._model.train()  # type: ignore[no-redef]
 
     def on_validation_epoch_end(self) -> None:
-        with jsonl.open(self._path_log_results, "a", dumps=lambda x: json.dumps(x, allow_nan=False, default=json_dumper_default)) as f:  # type: ignore[call-arg]
+        # with h5py.File(self._path_log_results.parent / "main_h5_predictions.h5", "a") as f:
+        #     none_of_them = (
+        #         script_convert_h5.H5_INPUT_IDS_KEY not in f and
+        #         script_convert_h5.H5_PREDICTIONS_KEY not in f and
+        #         script_convert_h5.H5_LABEL_IDS_KEY not in f
+        #     )
+        #     all_of_them = (
+        #         script_convert_h5.H5_INPUT_IDS_KEY in f and
+        #         script_convert_h5.H5_PREDICTIONS_KEY in f and
+        #         script_convert_h5.H5_LABEL_IDS_KEY in f
+        #     )
+
+        #     assert none_of_them or all_of_them, list(f.keys())
+
+        #     sorted_keys = np.array(sorted(self._results_to_log), dtype=np.int64)
+        #     tokenized_inputs = np.array([self._tokenizer(x) for x in sorted_keys], dtype=np.int64)
+        #     tokenized_preds = self._results_to_log[True][sorted_keys]
+
+        #     if none_of_them:
+        #         f.create_dataset(
+        #             script_convert_h5.H5_INPUT_IDS_KEY, 
+        #             data=self._results_to_log[script_convert_h5.H5_INPUT_IDS_KEY][True],
+        #             max_shape=(None, ),
+        #         )
+        #         f.create_dataset(
+        #             script_convert_h5.H5_PREDICTIONS_KEY, 
+        #             data=self._results_to_log[script_convert_h5.H5_PREDICTIONS_KEY][True],
+        #             max_shape=(None, ),
+        #         )
+        #         f.create_dataset(
+        #             script_convert_h5.H5_LABEL_IDS_KEY, 
+        #             data=None,
+        #             max_shape=(None, ),
+        #         )
+        #     else:
+        #         pass
+
+        with jsonl.open(
+            self._path_log_results, 
+            "a", 
+            dumps=lambda x: json.dumps(x, default=json_dumper_default)
+        ) as f:  # type: ignore[call-arg]
             f.write(dict(
                 epoch=self.current_epoch,
                 results=self._results_to_log,
@@ -1058,11 +1111,16 @@ def main(
     ###########################################################################
     # Should not change
     ###########################################################################
-    data_name=                                          "349_6_6_200000.json.pkl",
-    subset_path="data/subsets/subset_10000_seed_453345_of_349_6_6_50000.json",
+    
+    # data_name="349_6_6_200000.json.pkl",
+    # subset_path=SCRIPT_DIR / "data/subsets/subset_10000_seed_453345_of_349_6_6_200000.json",
+
+    data_name=                                      "349_6_6_10000.json.pkl",
+    subset_path=SCRIPT_DIR / "data/subsets/subset_5000_seed_453345_of_349_6_6_10000.json",
+    
     inf_num=6,
-    abs_pos_embs_mode=general_shared_constants.AbsPosEmbsModes.learned_pos_embs,
-    rel_pos_embs_mode=general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs,
+    abs_pos_embs_mode=general_shared_constants.AbsPosEmbsModes.no_abs_pos_embs,
+    rel_pos_embs_mode=general_shared_constants.RelPosEmbsChoices.two_embedders,
     num_rel_pos_embs=64,
     max_epochs=100,
 
@@ -1076,16 +1134,17 @@ def main(
     # Changes often
     ###########################################################################
     seed=453345,
-    freeform_options=[True, False],
+    freeform_options=[True],  # Not freeform is useless.
     dataset_type=general_shared_constants.DatasetTypesChoices.oracle_basic_dataset,
-    max_level_training=6,
+    max_level_training=3,
     do_log_results=True,
-    path_log_results=DEFAULT_SAVE_DIR / "results.json",
+    path_log_results=SCRIPT_DIR / "log_results/test_bench/predictions.jsonl",
 
     ###########################################################################
     # Changes with model size
     ###########################################################################
-    batch_size=256,
+    batch_size=64,
+    accumulate_grad_batches=4,
 
     ###########################################################################
     # Model Stuff
@@ -1095,11 +1154,17 @@ def main(
     n_layers=2,
     n_heads=4,
 ):
-    general_utils.check_and_print_args(locals().copy(), main)
+    all_arguments = locals().copy()
+    general_utils.check_and_print_args(all_arguments, main)
 
+    subset_path: Final[Path] = Path(subset_path)
     extra_info_file: Final[Path] = Path(extra_info_file)
     checkpoints_folder: Final[Path] = Path(checkpoints_folder)
     path_log_results: Final[Path] = Path(path_log_results)
+
+    assert subset_path.exists()
+    assert data_name.split(".")[0] in subset_path.name, (
+        f"{subset_path.name} {data_name.split('.')[0]}")
 
     if extra_info_file.exists():
         with extra_info_file.open() as f:
@@ -1113,7 +1178,9 @@ def main(
 
     # This is just to make the use without the launcher easier, we don't have to create
     # The parent folder, which we assume would have to be created for this purpose
-    if not resuming and extra_info_file.parent == checkpoints_folder.parent == path_log_results.parent:
+    if (not resuming and extra_info_file.parent == 
+        checkpoints_folder.parent == path_log_results.parent
+    ):
         extra_info_file.parent.mkdir(parents=False, exist_ok=True)
 
     ###########################################################################
@@ -1136,7 +1203,9 @@ def main(
 
     fix_str = f"abs_pe_{abs_pos_embs_mode}"
     rel_str = f"rel_pe_{rel_pos_embs_mode}_{num_rel_pos_embs}_" if rel_pos_embs_mode else ""
-    run_name = f"{rel_str}{fix_str}_trained_{max_level_training}_inf_{inf_num}_{ds_str}" # "_h_size_{h_size}_n_layers_{n_layers}_n_heads_{n_heads}"
+    
+    # "_h_size_{h_size}_n_layers_{n_layers}_n_heads_{n_heads}"
+    run_name = f"{rel_str}{fix_str}_trained_{max_level_training}_inf_{inf_num}_{ds_str}" 
     
     if resuming:
         with extra_info_file.open() as f:
@@ -1147,7 +1216,8 @@ def main(
 
             for i, v in enumerate(extra_info["python_rng_state"]):
                 if isinstance(v, list):
-                    extra_info["python_rng_state"][i] = tuple(extra_info["python_rng_state"][i])
+                    extra_info["python_rng_state"][i] = tuple(
+                        extra_info["python_rng_state"][i])
 
             random.setstate(tuple(extra_info["python_rng_state"]))
 
@@ -1163,12 +1233,14 @@ def main(
         wandb_run_id = None
 
 
-    rich.print(f"Run name: [green]'{run_name}'\n")
-    general_utils.print_dict(all_arguments)
+    rich.print(f"[bold]Run name:[/bold] [green]\"{run_name}\"\n")
 
     if do_log_results:
         if path_log_results.exists():
-            assert resuming, f"The log file already exists, but we are not resuming: {path_log_results}"
+            assert resuming, (
+                f"The log file already exists,"
+                f" but we are not resuming: {path_log_results}"
+            )
 
     ###########################################################################
     # Load the data    
@@ -1347,6 +1419,7 @@ def main(
         max_epochs=max_epochs,
         gpus=NUM_GPUS,
         check_val_every_n_epoch=EVAL_EVERY_N_EPOCHS,
+        accumulate_grad_batches=accumulate_grad_batches,
     )
     
     if resuming:

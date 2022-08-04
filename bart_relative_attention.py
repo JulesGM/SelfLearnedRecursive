@@ -1,19 +1,50 @@
-from beartype.typing import *
+
+"""
+Add relative attention to BART.
+
+"""
+
+# Stdlib
 import math
 import time
+from typing import *
 
-import pretty_traceback  # type: ignore
-pretty_traceback.install()
-
-from tqdm import tqdm  # type: ignore
-import torch
-from torch import nn
+# Third party
+import functorch as ft  # type: ignore[import]
+try:
+    import pretty_traceback  # type: ignore
+    pretty_traceback.install()
+except ImportError:
+    pass
 import numpy as np
-
+import rich
+import torch
+import torch.amp
+from torch import nn
+from tqdm import tqdm  # type: ignore
 import transformers.models.bart.modeling_bart as original
 
+# First party
 import general_shared_constants
+import general_utils
 
+def build_rel_attn_fn():
+    def inter(q, k, r):
+        assert k.shape == r.shape, (k.shape, r.shape)
+        assert q.shape[0] == k.shape[1] == k.shape[1], (q.shape[0], k.shape[1], k.shape[1])
+        assert q.ndim == 1, q.ndim
+
+        s0 = k + r  # Both L2 x H
+        output = s0 @ q  # Output is multiplied by q
+        
+        return output
+
+    # (L1, H) -> H, (L2, H) -> (L2, H) and (L2, L1, H) -> L2, H
+    a1 = ft.vmap(inter, (0, None, 1), 0) 
+    # (B, L1, H) -> (L1, H), (B, L2, H) -> (L2, H) and (B, L1, L2, H) -> (L1, L2, H)
+    rel_attn = ft.vmap(a1, (0, 0, 0), 0) 
+
+    return rel_attn
 
 class RelAttBartAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -44,6 +75,8 @@ class RelAttBartAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.rel_attn_fn = build_rel_attn_fn()
+
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return (
@@ -56,8 +89,8 @@ class RelAttBartAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        rel_att_keys: torch.nn.Embedding,
-        rel_att_values: torch.nn.Embedding,
+        rel_att_keys: torch.Tensor,
+        rel_att_values: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[tuple[torch.Tensor, ...]] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -76,23 +109,40 @@ class RelAttBartAttention(nn.Module):
 
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
+        
+        verbose = False
         # get key, value proj
         if is_cross_attention and past_key_value is not None:
+            # We're doing cross attention and have cached values
             # reuse k,v, cross_attentions
+            if verbose:
+                print(f"yes CROSS yes PAST: Num past: seq len {past_key_value.shape[2]}")
             key_states = past_key_value[0]
             value_states = past_key_value[1]
         elif is_cross_attention:
+            # We're doing cross attention and don't have cached values
             # cross_attentions
+            if verbose:
+                print("yes CROSS not PAST")
             key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
             value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
         elif past_key_value is not None:
+            # We're not doing cross attention but we have cached values
             # reuse k, v, self_attention
+            if verbose:
+                print(f"not CROSS yes PAST. Num past: {past_key_value[0].shape[2]}")
+            # If we're not doing cross attention we need to also
+            # compute the key and value of the current state(s)
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
         else:
+            # We're not doing cross attention and don't have cached values
             # self_attention
+            if verbose:
+                print("not CROSS not PAST")
+            # We have all hidden states
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
@@ -106,35 +156,75 @@ class RelAttBartAttention(nn.Module):
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             past_key_value = (key_states, value_states)
 
-        
+        # bsz x num_heads x ? x head_dim
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape) # 
-        key_states = key_states.view(*proj_shape) # + rel_att_keys
-        value_states = value_states.view(*proj_shape) # + rel_att_values
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape) #  bsz x num_heads x ? x head_dim
+        key_states = key_states.view(*proj_shape)  # bsz x num_heads x ? x head_dim
+        value_states = value_states.view(*proj_shape)  # bsz x num_heads x ? x head_dim
         
         src_len = key_states.size(1)
+        tgt_len = query_states.size(1)
 
-        rel_att_keys = rel_att_keys.view(bsz * self.num_heads, src_len, src_len, self.head_dim)  # type: ignore[operator]
-        rel_att_values = rel_att_values.view(bsz * self.num_heads, src_len, tgt_len, self.head_dim)  # type: ignore[operator]
-
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
-        dtype = attn_weights.dtype 
+        # Each head is seen as a different batch samples in a way (before they are remerged), a bit like beams often are in decoding
+        # Both here should be grids with src_len x tgt_len. Each src_len attends to each of the tgt_len.
         
+        
+        ###################################################################################################
         # Rel Att
-        dummy_query_states = query_states.view(bsz * self.num_heads, tgt_len, 1      , self.head_dim) # .repeat(1, 1      , src_len, 1)
-        dummy_key_states   = key_states  .view(bsz * self.num_heads, 1      , src_len, self.head_dim) #.repeat(1, tgt_len, 1      , 1)
-        dummy_value_states = value_states.view(bsz * self.num_heads, src_len, 1      , self.head_dim) #.repeat(1, 1      , src_len, 1)
-
-
-        dummy_key_states_rel = (dummy_key_states + rel_att_keys)
-        dummy_atten_weights_b = torch.einsum("ijkl, ijkl->ijk", (dummy_query_states, dummy_key_states))
+        ###################################################################################################
+        REL_ATT_ON = True
+        TORCH_VER = True
+        tgt_len = query_states.shape[1]
         
-        assert dummy_atten_weights_b.shape == attn_weights.shape, f"{dummy_atten_weights_b.shape} != {attn_weights.shape}"
-        assert torch.allclose(attn_weights, dummy_atten_weights_b), "ref <> b"        
+        # print(rel_att_values.shape)
+
+        if TORCH_VER:
+            rel_att_keys   = rel_att_keys  .view(bsz * self.num_heads, src_len, -1, self.head_dim).type(query_states.dtype)  # type: ignore[operator]
+            rel_att_values = rel_att_values.view(bsz * self.num_heads, src_len, -1, self.head_dim).type(query_states.dtype)  # type: ignore[operator]
+            
+            dummy_query_states = query_states.view(bsz * self.num_heads,       1, tgt_len, self.head_dim) 
+            dummy_key_states   = key_states  .view(bsz * self.num_heads, src_len,       1, self.head_dim) 
+
+            if REL_ATT_ON:
+                dummy_key_states = dummy_key_states + rel_att_keys
+
+            # We're just looking for the head_dim to disappear
+            attn_weights = torch.einsum("ijkl, ijkl->ijk", (dummy_query_states, dummy_key_states)).transpose(1, 2)        
+        else:
+            rel_att_keys   = rel_att_keys  .view(bsz * self.num_heads, src_len, -1, self.head_dim).type(query_states.dtype)  # type: ignore[operator]
+            rel_att_values = rel_att_values.view(bsz * self.num_heads, src_len, -1, self.head_dim).type(query_states.dtype)  # type: ignore[operator]
+
+            if REL_ATT_ON:
+                maybe_rel_att = rel_att_keys
+            else:
+                maybe_rel_att = torch.zeros_like(rel_att_keys)
+
+            dummy_query_states = query_states.view(bsz * self.num_heads, tgt_len, self.head_dim) 
+            dummy_key_states   = key_states  .view(bsz * self.num_heads, src_len, self.head_dim)
+
+            assert dummy_query_states.shape[0] == dummy_key_states.shape[0] == maybe_rel_att.shape[0], (
+                f"{dummy_query_states.shape = }", f"{dummy_key_states.shape = }", f"{maybe_rel_att.shape = }")
+            assert dummy_query_states.shape[1] == maybe_rel_att.shape[2], (
+                f"{dummy_query_states.shape = }", f"{maybe_rel_att.shape = }")
+            assert dummy_key_states.shape[1] == maybe_rel_att.shape[1], (
+                f"{dummy_key_states.shape = }", f"{maybe_rel_att.shape = }")
+            assert dummy_query_states.shape[2] == dummy_key_states.shape[2] == maybe_rel_att.shape[3], (
+                f"{dummy_query_states.shape = }", f"{dummy_key_states.shape = }", f"{maybe_rel_att.shape = }")
+
+            attn_weights = self.rel_attn_fn(dummy_query_states, dummy_key_states, maybe_rel_att)
+
+        if not REL_ATT_ON:
+            orig_attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+            rel_err = torch.allclose(orig_attn_weights, attn_weights, rtol=1/100)
+            qty_err = torch.isclose(orig_attn_weights, attn_weights).float().mean() > 0.99
+            assert rel_err or qty_err, "ref != b"
+
+        ###################################################################################################
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is {attn_weights.size()}"
+                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)},"
+                f" but is {attn_weights.size()}"
             )
 
         if attention_mask is not None:
@@ -178,8 +268,20 @@ class RelAttBartAttention(nn.Module):
             attn_weights, p=self.dropout, training=self.training
         )
 
-        value_states_rel = dummy_value_states + rel_att_values
-        attn_output = torch.bmm(attn_probs, value_states)
+
+        ###################################################################################################
+        # Rel Att
+        ###################################################################################################
+        dummy_value_states = value_states.view(bsz * self.num_heads, src_len, 1, self.head_dim)
+        if REL_ATT_ON:
+            dummy_value_states = dummy_value_states + rel_att_values
+        attn_output = torch.einsum("byx, bxyh->byh", attn_probs, dummy_value_states)
+
+        if not REL_ATT_ON:
+            orig_attn_output = torch.bmm(attn_probs, value_states) # + rel_att_values.type(value_states.dtype)
+            assert torch.allclose(orig_attn_output, attn_output), "ref != b"
+        ###################################################################################################
+
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -205,20 +307,24 @@ def _build_rel_att_mat_ref(
     attention_mask: torch.Tensor,
     num_embeddings: int,
 ):
+    assert False
     batch_size = attention_mask.shape[0]
-    seq_len = attention_mask.shape[1]
+    src_len = attention_mask.shape[1]
+    tgt_len = attention_mask.shape[2]
+
     relative_ids_test = torch.empty(
-        batch_size, seq_len, seq_len, 
+        batch_size, src_len, tgt_len, 
         dtype=torch.long
     )
+
     for batch_idx in range(batch_size):
         q_incr = 0
-        for q_idx in range(seq_len):
+        for q_idx in range(src_len):
             if attention_mask[batch_idx, q_idx]:
                 q_incr += 1
 
             k_incr = 0
-            for k_idx in range(seq_len):
+            for k_idx in range(src_len):
                 if attention_mask[batch_idx, k_idx]:
                     k_incr += 1
 
@@ -230,14 +336,41 @@ def _build_rel_att_mat_ref(
     return relative_ids_test
 
 
-def _build_rel_att_mat_test(
+def _build_rel_att_mat(
     attention_mask: torch.Tensor,
     num_embeddings: int,
+    tgt_array_indices: Optional[torch.Tensor],
 ):
-    query_idx = attention_mask.cumsum(-1).reshape(attention_mask.shape[0], attention_mask.shape[1], 1)
-    key_idx = attention_mask.cumsum(-1).reshape(attention_mask.shape[0], 1, attention_mask.shape[1])
+    """
+        - In bidirectional setting, TGT == SRC
+        - In masked self attention, with caching, SRC = Sequence decoded so far, TGT = current token
+    """
+    
+
+    bsz = attention_mask.shape[0]
+    src_len = attention_mask.shape[1]
+
+    attention_mask_cs = attention_mask.cumsum(-1)
+
+    key_idx = attention_mask_cs.reshape(bsz, src_len, 1)
+    query_idx = attention_mask_cs
+
+    if tgt_array_indices is None:
+        # rich.print(f"[red]Internal step no past")
+        tgt_len = src_len
+        query_idx = query_idx.reshape(bsz, 1, src_len)  # Self attention, we do them all
+        # general_utils.check_shape(query_idx.shape, (bsz, 1, src_len))
+    else:
+        # rich.print(f"[red]Internal step with past {tgt_array_indices}")
+        tgt_len = tgt_array_indices.shape[1]
+        assert tgt_array_indices.shape[0] == 1, tgt_array_indices.shape
+        query_idx = query_idx[:, tgt_array_indices[0]].reshape(bsz, 1, tgt_len)
+        # general_utils.check_shape(query_idx.shape, (bsz, 1, tgt_len))
+
     output = torch.clamp(key_idx - query_idx  + num_embeddings // 2, 0, num_embeddings - 1)
 
+    general_utils.check_shape(output.shape, (bsz, src_len, tgt_len))
+    # print(f"emb shape: {output.shape} {tgt_array_indices.shape if tgt_array_indices else None}")
     return output
 
 
@@ -350,12 +483,15 @@ class RelPosEmbs(nn.Module):
         else:
             raise ValueError(f"mode must be 1 or 2, got {mode}")
 
-    def forward(self, attention_mask: torch.Tensor):
+    def forward(
+        self, attention_mask: torch.LongTensor, tgt_array_indices: torch.LongTensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert len(attention_mask.shape) == 2, len(attention_mask.shape)
 
-        positions = _build_rel_att_mat_test(
+        positions = _build_rel_att_mat(
             attention_mask=attention_mask, 
             num_embeddings=self.num_embeddings, 
+            tgt_array_indices=tgt_array_indices,
         )
         
         if self.mode == general_shared_constants.RelPosEmbsChoices.two_embedders:
@@ -532,11 +668,11 @@ if __name__ == "__main__":
     for i in range(N):
         args = build_args()
         start = time.perf_counter()
-        res_test = _build_rel_att_mat_test(**args)
+        res_test = _build_rel_att_mat(**args)
         speeds_not_jitted.append(time.perf_counter() - start)
     print(f"Not jitted: {np.mean(speeds_not_jitted)}")
 
-    jitted = torch.jit.script(_build_rel_att_mat_test)
+    jitted = torch.jit.script(_build_rel_att_mat)
     speeds_jitted = []
     for i in range(N):
         args = build_args()

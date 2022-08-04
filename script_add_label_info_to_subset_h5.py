@@ -53,49 +53,9 @@ def work(
     queue.put(None)
 
 
-def build_eval_subset_sorted_by_keys(data_path, subset_path):
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Load the eval ds
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    
-    start = time.perf_counter()
-    with open(data_path, "rb") as f:
-        dataset_dict = pickle.load(f)
-    end = time.perf_counter()
-
-    print(f"Loaded the pkl dataset in {end - start:.2f} seconds")
-    valid_ds = dataset_dict[script_convert_h5.MAIN_DATASET_DATA_KEY][script_convert_h5.MAIN_DATASET_EVAL_KEY]
-    del dataset_dict
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Load the subset file and apply it to the eval ds
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    subset_indices, subset_str = script_data_subset_selection.read_subset_file(
-        data_path, subset_path
-    )
-    valid_ds_subset = {}
-    for level, nodes in tqdm(valid_ds.items(), desc="Applying the subset"):
-        assert isinstance(level, int)
-        valid_ds_subset[level] = [nodes[idx] for idx in subset_indices[level]]
-    del valid_ds, subset_indices, subset_str
-    
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # extract the order of the nodes in the subset
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    subset_per_key = {}
-    for level, node_list in valid_ds_subset.items():
-        for node in node_list:
-            subset_per_key[node[script_convert_h5.NODE_INPUT_STR_KEY]] = node
-    sorted_by_keys = dict(sorted(subset_per_key.items(), key=lambda item: item[0]))
-    
-    return sorted_by_keys
-
-
 def main(
     dir_path: PathType = SCRIPT_DIR / "log_results/basic/",
-    subset_path: PathType = (script_convert_h5.DATA_DIR / 
-        "subsets/subset_10000_seed_453345_of_349_6_6_200000.json"), 
+    subset_path: PathType = (script_convert_h5.DATA_DIR / "subsets/subset_10000_seed_453345_of_349_6_6_200000.json"), 
     data_path: PathType = script_convert_h5.DATA_DIR / "349_6_6_200000.json.pkl",
     num_procs: int = 10,
     dry: bool = False,
@@ -173,7 +133,7 @@ def main(
     print()
     rich.print("[bold]Prepare the subset.")
     start = time.perf_counter()
-    sorted_by_keys = build_eval_subset_sorted_by_keys(data_path, subset_path)
+    sorted_by_keys = script_convert_h5.build_eval_subset_sorted_by_keys(data_path, subset_path)
     end = time.perf_counter()
     print(f"Built the subset in {end - start:.1f} seconds")
     print()

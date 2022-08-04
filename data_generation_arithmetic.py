@@ -45,6 +45,7 @@ from typing import *
 from beartype import beartype
 import fire  # type: ignore[import]
 import numpy as np
+import torch
 
 try:
     import pretty_traceback  # type: ignore
@@ -96,9 +97,17 @@ def tree_depth_from_str(tree_string: str) -> int:
     return val
 
 
-def tree_depth_from_ids(ids: np.ndarray, tokenizer: data_tokenizer.ArithmeticTokenizer):
+def tree_depth_from_ids(
+    ids: Union[np.ndarray, list, "torch.Tensor"], 
+    tokenizer: data_tokenizer.ArithmeticTokenizer,
+):
+    if isinstance(ids, torch.Tensor):
+        ids = ids.cpu().detach().numpy()
+    
     if not isinstance(ids, np.ndarray):
-        ids = np.array(ids, np.float64)
+        ids = tokenizer.pad_array(ids)
+
+    ids = cast(np.ndarray, ids)
 
     assert ids.dtype == np.int64, ids.dtype
 
@@ -152,11 +161,11 @@ def load_dataset(
     ###########################################################################
     dicts: dict[str, Any]
     if pkl_path:
-        rich.print(f'Loading PKL data file "{pkl_path}"')
+        rich.print(f'[bold]Loading PKL data file:[/] "{pkl_path}"\n')
         with open(pkl_path, "rb") as f:
             dicts = pickle.load(f)
     else:
-        rich.print(f'Loading JSON data file "{json_path}"')
+        rich.print(f'[bold]Loading JSON data file:[/] "{json_path}"\n')
         assert json_path
         with open(json_path, "r") as f:
             dicts = json.loads(f.read())
@@ -172,7 +181,7 @@ def load_dataset(
     ###########################################################################
     # Parse the dataset.
     ###########################################################################
-    LOGGER.debug(f"Parsing structures from the dicts.")
+    rich.print(f"Parsing structures from the dicts.")
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Do a sanity check about the structure of the data
@@ -214,6 +223,7 @@ def load_dataset(
 
 
     LOGGER.debug(f"Done loading dataset.")
+    
     return output, config_obj
 
 
@@ -1090,14 +1100,7 @@ class EntryPoints:
                 self.answer = answer
                 self.ids = tokenizer.encode(equation_str)
 
-        def pad(ids_arrays, pad_token_id):
-            maxlen = max([len(ids) for ids in ids_arrays])
-            concatenated = [np.concatenate(
-                (ids, [pad_token_id] * (maxlen - len(ids)))) 
-                for ids in ids_arrays]
-            assert np.all([len(x) == len(concatenated[0]) 
-                for x in concatenated[1:]]), [len(x) for x in concatenated]
-            return np.array(concatenated, dtype=np.int64)
+        
 
         entries = [
             Entry(
@@ -1128,7 +1131,7 @@ class EntryPoints:
             random.shuffle(shuffled)
 
             ids = [x.ids for x in shuffled]
-            ids = pad(ids, tokenizer.pad_token_id)
+            ids = tokenizer.pad_array(id)
 
             answers = np.array([x.answer for x in shuffled], dtype=np.int64)
             from_ids_array = tree_depth_from_ids(

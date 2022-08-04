@@ -206,7 +206,7 @@ class ModifiedBartEncoder(original.BartPretrainedModel):
             self.rel_pos_embs = bart_relative_attention.RelPosEmbs(
                 model_d=config.d_model, 
                 mode=rel_pos_embs_mode,
-                num_embeddings=num_rel_pos_embs
+                num_embeddings=num_rel_pos_embs,
             )
 
         else:
@@ -228,6 +228,8 @@ class ModifiedBartEncoder(original.BartPretrainedModel):
 
     def forward(
         self,
+        *,
+        tgt_array_indices,
         input_ids=None,
         attention_mask=None,
         head_mask=None,
@@ -309,7 +311,12 @@ class ModifiedBartEncoder(original.BartPretrainedModel):
         if self.rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
             rel_att_keys, rel_att_values = self.rel_pos_embs(
                 attention_mask=attention_mask,
+                tgt_array_indices=tgt_array_indices,
             )
+            assert rel_att_keys.dtype == inputs_embeds.dtype, rel_att_keys.dtype
+            assert rel_att_values.dtype == inputs_embeds.dtype, rel_att_values.dtype
+            assert rel_att_keys.device == inputs_embeds.device, rel_att_keys.device
+            assert rel_att_values.device == inputs_embeds.device, rel_att_values.device
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         hidden_states = inputs_embeds
@@ -444,7 +451,8 @@ class ModifiedBartDecoder(original.BartDecoder):
 
         if rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
             self.layers = nn.ModuleList(
-                [bart_relative_attention.RelAttBartDecoderLayer(config) for _ in range(config.decoder_layers)]
+                [bart_relative_attention.RelAttBartDecoderLayer(config) 
+                for _ in range(config.decoder_layers)]
             )
             self.rel_pos_embs = bart_relative_attention.RelPosEmbs(
                 model_d=config.d_model, 
@@ -489,8 +497,16 @@ class ModifiedBartDecoder(original.BartDecoder):
 
         return combined_attention_mask
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
+        *,
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
+        # Modified by us
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        decoder_position_ids: Optional[torch.LongTensor],
+        tgt_array_indices: Optional[torch.LongTensor],
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
@@ -503,13 +519,7 @@ class ModifiedBartDecoder(original.BartDecoder):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Jules
-        # Modified by us
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        decoder_position_ids: Optional[torch.LongTensor] = None,
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    ) -> Union[Tuple, original.BaseModelOutputWithPastAndCrossAttentions]:
+    ) -> Union[Tuple, original.BaseModelOutputWithPastAndCrossAttentions]:    
         r"""
         Args:
             input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
@@ -689,6 +699,7 @@ class ModifiedBartDecoder(original.BartDecoder):
         if self.rel_pos_embs_mode != general_shared_constants.RelPosEmbsChoices.no_rel_pos_embs:
             rel_att_keys, rel_att_values = self.rel_pos_embs(
                 attention_mask=un_prepared_attention_mask,
+                tgt_array_indices=tgt_array_indices,
             )
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -845,6 +856,14 @@ class ModifiedBartModel(original.BartModel):
 
     def forward(
         self,
+        *,
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
+        # Added by me
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        decoder_position_ids: Optional[torch.LongTensor],
+        tgt_array_indices: Optional[torch.LongTensor] = None,
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.LongTensor] = None,
@@ -860,12 +879,6 @@ class ModifiedBartModel(original.BartModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Jules
-        # Added by me
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        decoder_position_ids: Optional[torch.LongTensor] = None,
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     ) -> Union[Tuple, original.Seq2SeqModelOutput]:
 
         # different to other models, Bart automatically creates decoder_input_ids from
@@ -899,6 +912,8 @@ class ModifiedBartModel(original.BartModel):
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(
+                tgt_array_indices=tgt_array_indices,
+
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
@@ -918,6 +933,9 @@ class ModifiedBartModel(original.BartModel):
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
         decoder_outputs = self.decoder(
+            decoder_position_ids=decoder_position_ids,
+            tgt_array_indices=tgt_array_indices,
+
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
             encoder_hidden_states=encoder_outputs[0],
@@ -930,7 +948,6 @@ class ModifiedBartModel(original.BartModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            decoder_position_ids=decoder_position_ids,
         )
 
         if not return_dict:
@@ -983,6 +1000,14 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
 
     def forward(
         self,
+        *,
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Jules
+        # Added by me
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        decoder_position_ids: Optional[torch.LongTensor] = None,
+        tgt_array_indices: Optional[torch.LongTensor] = None,
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         decoder_input_ids: Optional[torch.LongTensor] = None,
@@ -999,12 +1024,6 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Jules
-        # Added by me
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        decoder_position_ids: Optional[torch.LongTensor] = None,
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     ) -> Union[Tuple, original.Seq2SeqLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1037,7 +1056,7 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
                 )
 
         outputs = self.model(
-            input_ids,
+            input_ids=input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=decoder_input_ids,
             encoder_outputs=encoder_outputs,
@@ -1057,6 +1076,7 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
             # Added by me
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
             decoder_position_ids=decoder_position_ids,
+            tgt_array_indices=tgt_array_indices,
             # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         )
         lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
@@ -1101,6 +1121,7 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
         cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
+        tgt_array_indices=None,
         **kwargs,
     ):
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1111,6 +1132,7 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
         assert decoder_head_mask is None
         assert cross_attn_head_mask is None
         decoder_attention_mask = decoder_input_ids != self.model.config.pad_token_id
+        
         assert kwargs == {}, kwargs
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1120,12 +1142,19 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
         # the decoder_input_ids inside of the forward call, because
         # we don't have the decoder_input_ids for that.
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        if decoder_attention_mask is not None and past:
+        assert tgt_array_indices is None, tgt_array_indices
+        if past:
+            assert decoder_attention_mask is not None 
+
             decoder_position_ids = decoder_attention_mask.cumsum(dim=-1) - 1
             decoder_position_ids.masked_fill_(decoder_attention_mask < 0, 0)
             decoder_position_ids = decoder_position_ids[:, -1:]
+            
+            tgt_array_indices = (torch.tensor(decoder_attention_mask.shape[1]) - 1).reshape(1, -1)
+            # rich.print(f"[green]There is a past. {tgt_array_indices}")
         else:
             decoder_position_ids = None
+            tgt_array_indices = None
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Jules.
@@ -1142,6 +1171,7 @@ class ModifiedBartForConditionalGeneration(original.BartForConditionalGeneration
             "decoder_input_ids": decoder_input_ids,
             "decoder_attention_mask": decoder_attention_mask,
             "decoder_position_ids": decoder_position_ids,
+            "tgt_array_indices": tgt_array_indices,
             "attention_mask": attention_mask,
             "head_mask": head_mask,
             "decoder_head_mask": decoder_head_mask,
@@ -1351,6 +1381,7 @@ def main(model=None):
         output_hidden_states=True,
         output_scores=True,
         return_dict_in_generate=True,
+        tgt_array_indices=None,
     )
     no_labels_a["decoder_input_ids"] = no_labels_a["decoder_input_ids"]
 

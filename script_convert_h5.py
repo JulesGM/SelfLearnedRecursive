@@ -18,6 +18,7 @@ import multiprocessing.pool as mp_pool
 import queue as threading_queue
 import itertools
 from pathlib import Path
+import pickle
 import subprocess
 import time
 import threading
@@ -34,7 +35,7 @@ from tqdm import tqdm  # type: ignore[import]
 
 import data_tokenizer
 import general_utils
-import script_add_label_info_to_subset_h5
+import script_data_subset_selection
 pretty_traceback.install()
 
 
@@ -192,12 +193,12 @@ def _convert(
         assert tokenizer.pad_token_id == 0, tokenizer.pad_token_id
         
         output_file.create_dataset(
-            "input_samples", 
+            H5_INPUT_IDS_KEY, 
             data=input_ids,
         )
 
         output_file.create_dataset(
-            "predictions",
+            H5_PREDICTIONS_KEY,
             shape=(num_epochs, num_samples, len_seqs_output),
             dtype=np.int64,
         )
@@ -291,6 +292,45 @@ class ThreadOrProcess(str, enum.Enum):
     process = "process"
 
 
+
+def build_eval_subset_sorted_by_keys(data_path, subset_path):
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Load the eval ds
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    
+    start = time.perf_counter()
+    with open(data_path, "rb") as f:
+        dataset_dict = pickle.load(f)
+    end = time.perf_counter()
+
+    print(f"Loaded the pkl dataset in {end - start:.2f} seconds")
+    valid_ds = dataset_dict[MAIN_DATASET_DATA_KEY][MAIN_DATASET_EVAL_KEY]
+    del dataset_dict
+
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Load the subset file and apply it to the eval ds
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    subset_indices, subset_str = script_data_subset_selection.read_subset_file(
+        data_path, subset_path
+    )
+    valid_ds_subset = {}
+    for level, nodes in tqdm(valid_ds.items(), desc="Applying the subset"):
+        assert isinstance(level, int)
+        valid_ds_subset[level] = [nodes[idx] for idx in subset_indices[level]]
+    del valid_ds, subset_indices, subset_str
+    
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # extract the order of the nodes in the subset
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    subset_per_key = {}
+    for level, node_list in valid_ds_subset.items():
+        for node in node_list:
+            subset_per_key[node[NODE_INPUT_STR_KEY]] = node
+    sorted_by_keys = dict(sorted(subset_per_key.items(), key=lambda item: item[0]))
+    
+    return sorted_by_keys
+
 @beartype
 def main(
     path: Union[str, Path] = SCRIPT_DIR / "log_results/oracle/",
@@ -349,8 +389,9 @@ def main(
     ###########################################################################
     print()
     rich.print("[bold]Preparing inputs and labels.")
-    sorted_by_keys = script_add_label_info_to_subset_h5.build_eval_subset_sorted_by_keys(
-        data_path, subset_path)
+    sorted_by_keys = build_eval_subset_sorted_by_keys(
+        data_path, subset_path
+    )
     
     label_ids = tokenize_pad_numpify(
         tokenizer, sorted_by_keys.values(),
@@ -430,7 +471,7 @@ def main(
         output_path = input_path.parent / f"{input_path.stem}.h5"
 
         with h5py.File(output_path, "r+") as f:
-            f.create_dataset("label_ids", data=label_ids)
+            f.create_dataset(H5_LABEL_IDS_KEY, data=label_ids,)
 
     with mp_pool.ThreadPool(n_cpus) as pool:
         promises = [pool.apply_async(write_label_ids, (path,)) for path in active]

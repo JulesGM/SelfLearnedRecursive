@@ -88,7 +88,8 @@ def compute_agreement(
     arrays = [file["predictions"][epoch_idx] for file in files]
 
     for samples in zip(*arrays):
-        text_samples = [extract_pred_fn(tokenizer.decode(sample, ignore_special_symbols=True)) for sample in samples]
+        text_samples = [extract_pred_fn(tokenizer.decode(
+            sample, ignore_special_symbols=True)) for sample in samples]
         top = collections.Counter(text_samples).most_common(1)
         top_1_agreement = top[0][1] / len(text_samples)
         top_1_agreement_per_sample.append(top_1_agreement)
@@ -240,7 +241,6 @@ def main(
         label = tokenizer.decode(sample, ignore_special_symbols=True).replace(" ", "")
         int(label)  # Labels should be valid integers. This "useless" conversion checks this.
         labels.append(label)
-
     
     promises = []
     accuracies_list = []
@@ -302,8 +302,8 @@ def main(
             top_1_all.append(top_1_agreement)
             pairwise_all.append(pairwise_agreement)
 
-    top_1_all = np.array(top_1_all, dtype=np.float64)
-    pairwise_all = np.array(pairwise_all, dtype=np.float64)
+    np_top_1_all = np.array(top_1_all, dtype=np.float64)
+    np_pairwise_all = np.array(pairwise_all, dtype=np.float64)
 
     duration = time.perf_counter() - start
     rich.print(f"[bold]Done computing agreement.[/bold]")
@@ -311,8 +311,8 @@ def main(
     rich.print(f"\t- CPUs used: {cpus_to_use}")
 
     print()
-    rich.print(f"[bold]Averaged Top-1 Agreement: {np.mean(top_1_all):0.1%}")
-    rich.print(f"[bold]Averaged Pairwise Agreement: {np.mean(pairwise_all):0.1%}")
+    rich.print(f"[bold]Averaged Top-1 Agreement: {np.mean(np_top_1_all):0.1%}")
+    rich.print(f"[bold]Averaged Pairwise Agreement: {np.mean(np_pairwise_all):0.1%}")
     print()
 
     rich.print(f"[bold]Saving results to {target_file} ...")
@@ -325,12 +325,12 @@ def main(
 
             f.create_dataset(
                 "top-1_all", 
-                data=top_1_all,
+                data=np_top_1_all,
             )
 
             f.create_dataset(
                 "pairwise_all", 
-                data=pairwise_all, 
+                data=np_pairwise_all, 
             )
 
             f.create_dataset(
